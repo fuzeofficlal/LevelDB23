@@ -1,0 +1,8 @@
+build/
+cmake-build-debug/
+.idea/
+.clangd/
+.cache/
+*.log
+testdb/
+autocompact_test_db/

@@ -1,0 +1,130 @@
+===== Result<T> 基本用法 =====
+10 / 3 = 3
+Error: Invalid Argument: Division by zero
+
+===== Result<T> Monadic 链式调用 =====
+Chain succeeded: answer=40
+Recovering from: Invalid Argument: Division by zero
+Recovered value: 0
+
+===== Result<void> 基本用法 =====
+ValidateConfig(true):  OK
+ValidateConfig(false): Corruption: config file corrupted
+
+===== Result<void> 链式调用 =====
+Pipeline (all ok):  OK
+Pipeline (disk err): IO Error: disk full
+
+===== LookupUser 双消息示例 =====
+Found: User_42
+Error: NotFound: user not found: id=9999
+
+===== Fixed32/64 编码解码 =====
+Fixed32: 12345 (expect 12345)
+Fixed64: 9876543210 (expect 9876543210)
+
+===== Varint32/64 编码解码 =====
+Varint32: 0 (expect 0)
+Varint32: 127 (expect 127)
+Varint32: 128 (expect 128)
+Varint32: 16384 (expect 16384)
+Varint64: 18446744073709551615 (expect 18446744073709551615)
+Remaining bytes: 0 (expect 0)
+
+===== VarintLength =====
+All static_assert passed (compile-time verified)
+
+===== 长度前缀字符串 =====
+Slice 1: hello (expect hello)
+Slice 2: world!! (expect world!!)
+Slice 3: nullopt (expect nullopt)
+
+===== 畸形输入处理 =====
+Empty input: nullopt (expect nullopt)
+Truncated varint: nullopt (expect nullopt)
+
+===== Hash 函数验证 =====
+Hash({}, seed):   0xbc9f1d34  ✓
+Hash(1 byte):     0xef1345c4  ✓
+Hash(2 bytes):    0x5b663814  ✓
+Hash(3 bytes):    0x323c078f  ✓
+Hash(4 bytes):    0xed21633a  ✓
+Hash(48 bytes):   0xf333dabb  ✓
+
+===== CRC32C 校验验证 =====
+CRC32C(zeros):    0x8a9136aa  ✓
+CRC32C(0xff):     0x62a8ab43  ✓
+CRC32C(0..31):    0x46dd794e  ✓
+CRC32C(31..0):    0x113fdb5c  ✓
+CRC32C Extend:    ✓
+Mask/Unmask:      ✓
+
+===== Random 随机数验证 =====
+Uniform(100) range: ✓
+OneIn(10) hits:     1021  ✓
+
+===== Arena 分配器验证 =====
+Allocate(100):      ✓
+Allocate(200):      ✓
+AllocateAligned(64): ✓ (aligned: ✓)
+MemoryUsage:        4104 bytes
+
+===== MutexLock 验证 =====
+MutexLock alias:    ✓ (compiles as std::scoped_lock)
+
+===== NoDestructor 验证 =====
+NoDestructor<string>: immortal  ✓
+
+===== Logging 工具验证 =====
+NumberToString:     12345678  ✓
+EscapeString:       hello\x01world
+ConsumeDecimal:     ✓ remaining="abc"
+Overflow detect:    ✓
+No digits detect:   ✓
+
+===== StdFileSystem 楠岃瘉 =====
+Test directory:     /tmp/leveldbtest 鉁?
+WritableFile:       鉁?
+SequentialFile read: 鉁?
+Options template:   鉁?
+
+===== WAL Log Writer / Reader 验证 =====
+WAL Writer:         ✓
+WAL Reader rec1:    ✓ (len=5)
+WAL Reader rec2:    ✓ (len=5)
+WAL Reader rec3:    ✓
+WAL Reader EOF:     ✓
+WAL Corruptions:    0 (expect 0)
+
+===== MemTable / SkipList 验证 =====
+Get(key1@200): Found: value1
+Get(key2@200): Error: NotFound: deleted in memtable
+Get(key2@100): Not Found
+Get(key3@200): Found: value3
+Iterator Output:
+  'key1' @ 100 : => -> value1
+  'key2' @ 102 : DEL -> 
+  'key2' @ 101 : => -> value2
+  'key3' @ 103 : => -> value3
+MemTable Iterator: ✓ (count=4)
+
+===== VersionEdit 编解码验证 =====
+VersionEdit Decode: ✓
+VersionEdit Content: ✓
+
+===== DBImpl 集成验证 =====
+DB::Open: ✓
+DB::Put: ✓
+DB::Get('hello'): world ✓
+DB::Get missing key: NotFound ✓
+
+===== Block Builder / Block 验证 =====
+Block first:        ✓
+Block seek 'b':     ✓
+Block seek 'bl':    ✓
+Block EOF:          ✓
+
+===== SSTable Builder / Table 验证 =====
+TableBuilder Finish: ✓
+Table FileSize:      3412 bytes
+Table Open failed:   Not Supported: Not implemented for POSIX yet

@@ -1,0 +1,12 @@
+总计 62252
+drwxrwxr-x  4 fuze fuze     4096  5月 19 15:50 .
+drwxrwxr-x 17 fuze fuze     4096  5月 19 16:01 ..
+drwxrwxr-x  3 fuze fuze     4096  5月 19 15:49 .cmake
+-rw-rw-r--  1 fuze fuze    14920  5月 19 15:49 CMakeCache.txt
+drwxrwxr-x  7 fuze fuze     4096  5月 19 15:50 CMakeFiles
+-rw-rw-r--  1 fuze fuze     2013  5月 19 15:50 cmake_install.cmake
+-rw-rw-r--  1 fuze fuze    10350  5月 19 15:50 compile_commands.json
+-rw-rw-r--  1 fuze fuze 15773623  5月 19 15:50 LevelDB_23.exe
+-rw-rw-r--  1 fuze fuze  8676760  5月 19 15:50 leveldbutil.exe
+-rw-rw-r--  1 fuze fuze 39207542  5月 19 15:50 libleveldb.a
+-rw-rw-r--  1 fuze fuze    32134  5月 19 15:50 Makefile

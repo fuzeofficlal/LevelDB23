@@ -1,0 +1,8 @@
+[
+{
+  "directory": "E:/LevelDB_23/cmake-build-debug",
+  "command": "C:\\mingw64\\bin\\g++.exe  @CMakeFiles/LevelDB_23.dir/includes_CXX.rsp -std=c++23 -o CMakeFiles\\LevelDB_23.dir\\main.cpp.obj -c E:\\LevelDB_23\\main.cpp",
+  "file": "E:/LevelDB_23/main.cpp",
+  "output": "CMakeFiles/LevelDB_23.dir/main.cpp.obj"
+}
+]

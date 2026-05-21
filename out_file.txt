@@ -1,0 +1,1 @@
+build/LevelDB_23.exe: PE32+ executable (console) x86-64, for MS Windows, 17 sections
