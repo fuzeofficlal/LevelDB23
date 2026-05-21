@@ -140,6 +140,10 @@ struct Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  // If true, enable coroutine async read path optimizations (cache fast-path,
+  // sharded queue executor).
+  bool async_optimize = false;
 };
 
 // Options that control read operations
@@ -157,6 +161,9 @@ struct ReadOptions {
   // not have been released).  If "snapshot" is null, use an implicit
   // snapshot of the state at the beginning of this read operation.
   const Snapshot* snapshot = nullptr;
+
+  // If true, enable coroutine async read path optimizations (cache fast-path).
+  bool async_optimize = false;
 };
 
 // Options that control write operations

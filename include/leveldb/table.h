@@ -72,6 +72,13 @@ class Table {
       const ReadOptions& options, std::string_view key,
       std::move_only_function<void(std::string_view, std::string_view)> handle_result);
 
+  // Checks if the key is in the table using filter and block cache.
+  // Returns true if handled synchronously (either found or not present in the block cache/filter).
+  // Returns false if cache miss, requiring a physical read.
+  bool InternalGetFast(
+      const ReadOptions& options, std::string_view key,
+      std::move_only_function<void(std::string_view, std::string_view)> handle_result);
+
   Task<Result<void>> InternalGetAsync(
       const ReadOptions& options, std::string_view key,
       std::move_only_function<void(std::string_view, std::string_view)> handle_result,

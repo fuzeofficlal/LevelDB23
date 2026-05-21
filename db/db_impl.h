@@ -68,6 +68,7 @@ class DBImpl : public DB {
   WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
   Task<Result<std::optional<std::string>>> GetAsync(const ReadOptions& options, std::string_view key);
+  Result<std::optional<std::string>> GetFast(const ReadOptions& options, std::string_view key);
   static Task<Result<void>> WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w);
   struct SyncTask {
     struct promise_type {

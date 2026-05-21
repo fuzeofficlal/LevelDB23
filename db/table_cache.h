@@ -39,6 +39,10 @@ class TableCache {
                    uint64_t file_size, std::string_view k,
                    std::move_only_function<void(std::string_view, std::string_view)> handle_result);
 
+  bool GetFast(const ReadOptions& options, uint64_t file_number,
+               uint64_t file_size, std::string_view k,
+               std::move_only_function<void(std::string_view, std::string_view)> handle_result);
+
   Task<Result<void>> GetAsync(const ReadOptions& options, uint64_t file_number,
                               uint64_t file_size, std::string_view k,
                               std::move_only_function<void(std::string_view, std::string_view)> handle_result,

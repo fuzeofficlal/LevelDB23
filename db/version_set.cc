@@ -251,6 +251,55 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
   return std::unexpected(Status::NotFoundErr("not found"));
 }
 
+bool Version::GetFast(const ReadOptions& options, const LookupKey& k, GetStats* stats,
+                      std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+                      bool* found_out) {
+  stats->seek_file = nullptr;
+  stats->seek_file_level = -1;
+
+  std::shared_ptr<FileMetaData> last_file_read;
+  int last_file_read_level = -1;
+
+  std::vector<std::pair<int, std::shared_ptr<FileMetaData>>> overlapping_files;
+  ForEachOverlapping(k.user_key(), k.internal_key(), [&](int level, std::shared_ptr<FileMetaData> f) {
+    overlapping_files.push_back({level, f});
+    return true; // Keep iterating
+  });
+
+  bool found = false;
+  *found_out = false;
+
+  for (const auto& [level, f] : overlapping_files) {
+    if (stats->seek_file == nullptr && last_file_read != nullptr) {
+      stats->seek_file = last_file_read;
+      stats->seek_file_level = last_file_read_level;
+    }
+
+    last_file_read = f;
+    last_file_read_level = level;
+
+    bool file_found = false;
+    bool success = vset_->table_cache_->GetFast(
+        options, f->number, f->file_size, k.internal_key(),
+        [&](std::string_view ikey, std::string_view v) {
+          handle_result(ikey, v);
+          file_found = true;
+          found = true;
+        });
+
+    if (!success) {
+      return false; // Cache miss
+    }
+
+    if (found) {
+      *found_out = true;
+      break;
+    }
+  }
+
+  return true; // Successfully checked all levels synchronously
+}
+
 Task<Result<std::optional<std::string>>> Version::GetAsync(
     const ReadOptions& options, const LookupKey& k, GetStats* stats, AsyncExecutor* executor) {
   stats->seek_file = nullptr;

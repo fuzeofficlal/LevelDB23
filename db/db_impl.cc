@@ -48,7 +48,8 @@ DBImpl::DBImpl(const Options<StdFileSystem>& options, std::string dbname)
       dbname_(std::move(dbname)),
       tmp_batch_(new WriteBatch),
       table_cache_(std::make_unique<TableCache>(dbname_, &options_, options_.max_open_files)),
-      versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)) {}
+      versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)),
+      async_executor_(4, options_.async_optimize) {}
 
 DBImpl::~DBImpl() {
   shutting_down_ = true;
@@ -371,6 +372,15 @@ WriteBatch* DBImpl::BuildBatchGroup(CoroutineWriter** last_writer) {
 
 Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& options,
                                                           std::string_view key) {
+  if (options.async_optimize) {
+    auto fast_res = GetFast(options, key);
+    if (fast_res) {
+      co_return fast_res;
+    } else if (fast_res.error().code() != StatusCode::kNotSupported || fast_res.error().message() != "cache miss") {
+      co_return fast_res;
+    }
+  }
+
   std::unique_lock<std::mutex> lk(mutex_);
   
   uint64_t seq = versions_->LastSequence();
@@ -408,6 +418,59 @@ Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& opt
   co_return v_res;
 }
 
+Result<std::optional<std::string>> DBImpl::GetFast(const ReadOptions& options,
+                                                   std::string_view key) {
+  std::unique_lock<std::mutex> lk(mutex_);
+
+  uint64_t seq = versions_->LastSequence();
+  if (options.snapshot != nullptr) {
+    seq = static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
+  }
+  LookupKey lkey(key, seq);
+
+  auto mem = mem_;
+  auto imm = imm_;
+  auto current = versions_->current();
+
+  lk.unlock();
+
+  if (mem) {
+    auto mem_res = mem->Get(lkey);
+    if (!mem_res) return std::unexpected(mem_res.error());
+    if (*mem_res) return std::string(**mem_res);
+  }
+  if (imm) {
+    auto imm_res = imm->Get(lkey);
+    if (!imm_res) return std::unexpected(imm_res.error());
+    if (*imm_res) return std::string(**imm_res);
+  }
+
+  Version::GetStats stats;
+  std::string value;
+  bool found_out = false;
+  bool completed = current->GetFast(options, lkey, &stats,
+      [&](std::string_view ikey, std::string_view v) {
+        value.assign(v.data(), v.size());
+      },
+      &found_out);
+
+  if (completed) {
+    if (stats.seek_file != nullptr) {
+      std::unique_lock<std::mutex> lk_stats(mutex_);
+      if (current->UpdateStats(stats)) {
+        MaybeScheduleCompaction();
+      }
+    }
+    if (found_out) {
+      return value;
+    } else {
+      return std::unexpected(Status::NotFoundErr("not found"));
+    }
+  }
+
+  return Status::NotSupportedErr("cache miss");
+}
+
 DBImpl::SyncTask DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
                                        Result<std::optional<std::string>>& result) {
   result = co_await task;
@@ -416,6 +479,15 @@ DBImpl::SyncTask DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>&
 
 Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
                                                std::string_view key) {
+  if (options.async_optimize) {
+    auto fast_res = GetFast(options, key);
+    if (fast_res) {
+      return fast_res;
+    } else if (fast_res.error().code() != StatusCode::kNotSupported || fast_res.error().message() != "cache miss") {
+      return fast_res;
+    }
+  }
+
   std::binary_semaphore sem{0};
   Result<std::optional<std::string>> result;
 

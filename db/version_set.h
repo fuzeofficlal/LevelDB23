@@ -58,6 +58,13 @@ class Version : public std::enable_shared_from_this<Version> {
   [[nodiscard]] Result<std::optional<std::string>> Get(
       const ReadOptions&, const LookupKey& key, GetStats* stats);
 
+  // Attempt to read from cached tables and blocks synchronously.
+  // Returns true if lookup completes synchronously (either found or not present).
+  // Returns false if cache miss occurs (requiring a physical read).
+  bool GetFast(const ReadOptions&, const LookupKey& key, GetStats* stats,
+               std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+               bool* found_out);
+
   [[nodiscard]] Task<Result<std::optional<std::string>>> GetAsync(
       const ReadOptions&, const LookupKey& key, GetStats* stats, AsyncExecutor* executor);
 

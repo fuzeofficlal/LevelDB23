@@ -72,6 +72,23 @@ Result<void> TableCache::Get(const ReadOptions& options, uint64_t file_number,
   return (*entry_res)->table->InternalGet(options, k, std::move(handle_result));
 }
 
+bool TableCache::GetFast(const ReadOptions& options, uint64_t file_number,
+                         uint64_t file_size, std::string_view k,
+                         std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+  std::shared_ptr<Entry> entry = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = cache_.find(file_number);
+    if (it != cache_.end()) {
+      entry = it->second;
+    }
+  }
+  if (entry == nullptr) {
+    return false;
+  }
+  return entry->table->InternalGetFast(options, k, std::move(handle_result));
+}
+
 Task<Result<void>> TableCache::GetAsync(
     const ReadOptions& options, uint64_t file_number, uint64_t file_size,
     std::string_view k,

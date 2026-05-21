@@ -234,6 +234,47 @@ Result<void> Table<SrcFile>::InternalGet(const ReadOptions& options, std::string
 }
 
 template <CRandomAccessFile SrcFile>
+bool Table<SrcFile>::InternalGetFast(const ReadOptions& options, std::string_view key,
+                                     std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+  auto iiter = rep_->index_block->NewIterator(rep_->options.comparator);
+  iiter->Seek(key);
+  bool completed = false;
+  if (iiter->Valid()) {
+    std::string_view handle_value = iiter->value();
+    FilterBlockReader* filter = rep_->filter;
+    BlockHandle handle;
+    std::string_view hv_copy = handle_value;
+    if (filter != nullptr && handle.DecodeFrom(hv_copy) &&
+        !filter->KeyMayMatch(handle.offset(), key)) {
+      // Key definitely not in this table. Fast path complete.
+      completed = true;
+    } else {
+      Cache* block_cache = rep_->options.block_cache;
+      if (block_cache != nullptr && handle.DecodeFrom(handle_value)) {
+        char cache_key_buffer[16];
+        EncodeFixed64(cache_key_buffer, rep_->cache_id);
+        EncodeFixed64(cache_key_buffer + 8, handle.offset());
+        std::string_view key_sv(cache_key_buffer, sizeof(cache_key_buffer));
+        auto cache_handle = block_cache->Lookup(key_sv);
+        if (cache_handle) {
+          Block* block = reinterpret_cast<Block*>(block_cache->Value(cache_handle.get()));
+          auto block_iter = block->NewIterator(rep_->options.comparator);
+          block_iter->Seek(key);
+          if (block_iter->Valid()) {
+            handle_result(block_iter->key(), block_iter->value());
+          }
+          completed = true;
+        }
+      }
+    }
+  } else {
+    // Index block indicates key is past any data, so definitely not found.
+    completed = true;
+  }
+  return completed;
+}
+
+template <CRandomAccessFile SrcFile>
 uint64_t Table<SrcFile>::ApproximateOffsetOf(std::string_view key) const {
   auto index_iter = rep_->index_block->NewIterator(rep_->options.comparator);
   index_iter->Seek(key);
