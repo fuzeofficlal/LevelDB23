@@ -11,6 +11,9 @@
 #include "db/db_iter.h"
 #include "table/merger.h"
 #include "leveldb/table_builder.h"
+#include "leveldb/comparator.h"
+#include "db/log_reader.h"
+#include "db/version_edit.h"
 
 namespace leveldb {
 
@@ -45,14 +48,13 @@ Options<StdFileSystem> SanitizeOptions(const Options<StdFileSystem>& src,
 
 DBImpl::DBImpl(const Options<StdFileSystem>& options, std::string dbname)
     : env_(options.env),
-      internal_comparator_(options.comparator),
+      internal_comparator_(options.comparator ? options.comparator : BytewiseComparator()),
       internal_filter_policy_(options.filter_policy ? std::make_unique<const InternalFilterPolicy>(options.filter_policy) : nullptr),
       options_(SanitizeOptions(options, &internal_comparator_, internal_filter_policy_.get())),
       dbname_(std::move(dbname)),
       tmp_batch_(new WriteBatch),
       table_cache_(std::make_unique<TableCache>(dbname_, &options_, options_.max_open_files)),
-      versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)) {
-}
+      versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
   shutting_down_ = true;
@@ -101,6 +103,85 @@ Result<void> DBImpl::Recover() {
   auto rec_res = versions_->Recover();
   if (!rec_res) return std::unexpected(rec_res.error());
 
+  // List all files in the directory
+  auto children_res = env_->GetChildren(dbname_);
+  if (!children_res) return std::unexpected(children_res.error());
+  auto filenames = std::move(*children_res);
+
+  // Find all log files
+  std::vector<uint64_t> logs;
+  for (const auto& fname : filenames) {
+    auto parsed = ParseFileName(fname);
+    if (parsed && parsed->type == kLogFile) {
+      if (parsed->number >= versions_->LogNumber() ||
+          (versions_->PrevLogNumber() != 0 && parsed->number == versions_->PrevLogNumber())) {
+        logs.push_back(parsed->number);
+      }
+    }
+  }
+  std::sort(logs.begin(), logs.end());
+
+  SequenceNumber max_sequence = 0;
+  VersionEdit edit;
+  bool save_manifest = false;
+  for (size_t i = 0; i < logs.size(); i++) {
+    auto status = RecoverLogFile(logs[i], (i == logs.size() - 1), &save_manifest, &edit, &max_sequence);
+    if (!status) return status;
+    versions_->MarkFileNumberUsed(logs[i]);
+  }
+
+  if (versions_->LastSequence() < max_sequence) {
+    versions_->SetLastSequence(max_sequence);
+  }
+
+  if (save_manifest) {
+    uint64_t new_log_number = versions_->NewFileNumber();
+    edit.SetLogNumber(new_log_number);
+    auto log_res = versions_->LogAndApply(&edit);
+    if (!log_res) return log_res;
+  }
+
+  return {};
+}
+
+Result<void> DBImpl::RecoverLogFile(uint64_t log_number, bool edit_save, bool* save_manifest, VersionEdit* edit, SequenceNumber* max_sequence) {
+  std::string logname = LogFileName(dbname_, log_number);
+  auto file_res = env_->NewSequentialFile(logname);
+  if (!file_res) return {}; // Log file may have been deleted or empty, ignore
+  auto file = std::make_unique<StdFileSystem::SequentialFile>(std::move(*file_res));
+
+  auto reporter = [](uint64_t bytes, const Status& s) {};
+  log::Reader<StdFileSystem::SequentialFile> reader(file.get(), reporter, true, 0);
+
+  std::string scratch;
+  auto mem = std::make_shared<MemTable>(internal_comparator_);
+  int count = 0;
+  while (auto record_opt = reader.ReadRecord(scratch)) {
+    std::string_view record = *record_opt;
+    if (record.size() < 12) continue;
+    WriteBatch batch;
+    WriteBatchInternal::SetContents(&batch, record);
+    auto ins_res = WriteBatchInternal::InsertInto(&batch, mem.get());
+    if (ins_res) {
+      count += WriteBatchInternal::Count(&batch);
+      auto seq = WriteBatchInternal::Sequence(&batch);
+      auto last_seq = seq + WriteBatchInternal::Count(&batch) - 1;
+      if (last_seq > *max_sequence) {
+        *max_sequence = last_seq;
+      }
+    }
+  }
+
+  if (count > 0) {
+    FileMetaData meta;
+    meta.number = versions_->NewFileNumber();
+    auto iter = mem->NewIterator();
+    auto build_res = BuildTable(dbname_, env_, options_, table_cache_.get(), iter.get(), &meta);
+    if (!build_res) return build_res;
+    edit->AddFile(0, meta.number, meta.file_size, meta.smallest, meta.largest);
+    *save_manifest = true;
+    versions_->MarkFileNumberUsed(meta.number);
+  }
   return {};
 }
 

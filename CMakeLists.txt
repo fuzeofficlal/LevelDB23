@@ -80,3 +80,6 @@ target_link_libraries(leveldbutil leveldb)
 
 add_executable(c_test db/c_test.c)
 target_link_libraries(c_test leveldb)
+
+add_executable(db_stress_test db/db_stress_test.cpp)
+target_link_libraries(db_stress_test leveldb)

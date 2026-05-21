@@ -47,6 +47,7 @@ class DBImpl : public DB {
   void CompactRange(const std::string_view* begin, const std::string_view* end) override;
 
   Result<void> Recover();
+  Result<void> RecoverLogFile(uint64_t log_number, bool edit_save, bool* save_manifest, VersionEdit* edit, SequenceNumber* max_sequence);
   void TEST_CompactRange(int level, const std::string_view* begin, const std::string_view* end);
   Result<void> TEST_CompactMemTable();
   void RecordReadSample(std::string_view key);
