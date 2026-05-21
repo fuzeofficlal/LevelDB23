@@ -51,8 +51,11 @@ DBImpl::DBImpl(const Options<StdFileSystem>& options, std::string dbname)
       versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
-  shutting_down_ = true;
-  background_work_finished_signal_.notify_all();
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    shutting_down_ = true;
+    background_work_finished_signal_.notify_all();
+  }
   if (bg_thread_ && bg_thread_->joinable()) {
     bg_thread_->join();
   }
