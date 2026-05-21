@@ -144,6 +144,18 @@ struct Options {
   // If true, enable coroutine async read path optimizations (cache fast-path,
   // sharded queue executor).
   bool async_optimize = false;
+
+  // If true, use thread-local pool allocator for coroutine frames.
+  bool coro_allocator = false;
+
+  // If true, use Chase-Lev lock-free deques for task execution.
+  bool lock_free_queue = false;
+
+  // If true, use io_uring for async random access file reads.
+  bool io_uring = false;
+
+  // If true, use zero-copy read path (PinnableValue).
+  bool zero_copy = false;
 };
 
 // Options that control read operations
@@ -164,6 +176,18 @@ struct ReadOptions {
 
   // If true, enable coroutine async read path optimizations (cache fast-path).
   bool async_optimize = false;
+
+  // If true, use thread-local pool allocator for coroutine frames.
+  bool coro_allocator = false;
+
+  // If true, use Chase-Lev lock-free deques for task execution.
+  bool lock_free_queue = false;
+
+  // If true, use io_uring for async random access file reads.
+  bool io_uring = false;
+
+  // If true, use zero-copy read path (PinnableValue).
+  bool zero_copy = false;
 };
 
 // Options that control write operations

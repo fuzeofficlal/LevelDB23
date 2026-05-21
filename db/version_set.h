@@ -11,6 +11,7 @@
 
 #include "db/dbformat.h"
 #include "db/version_edit.h"
+#include "leveldb/db.h"
 #include "leveldb/options.h"
 #include "leveldb/std_file_system.h"
 #include "leveldb/iterator.h"
@@ -55,17 +56,17 @@ class Version : public std::enable_shared_from_this<Version> {
 
   // Lookup the value for key.  If found, returns the value.
   // Fills *stats for potential compaction trigger.
-  [[nodiscard]] Result<std::optional<std::string>> Get(
+  [[nodiscard]] Result<std::optional<PinnableValue>> Get(
       const ReadOptions&, const LookupKey& key, GetStats* stats);
 
   // Attempt to read from cached tables and blocks synchronously.
   // Returns true if lookup completes synchronously (either found or not present).
   // Returns false if cache miss occurs (requiring a physical read).
   bool GetFast(const ReadOptions&, const LookupKey& key, GetStats* stats,
-               std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+               std::move_only_function<void(std::string_view, PinnableValue)> handle_result,
                bool* found_out);
 
-  [[nodiscard]] Task<Result<std::optional<std::string>>> GetAsync(
+  [[nodiscard]] Task<Result<std::optional<PinnableValue>>> GetAsync(
       const ReadOptions&, const LookupKey& key, GetStats* stats, AsyncExecutor* executor);
 
   bool UpdateStats(const GetStats& stats);

@@ -47,6 +47,8 @@ class StdRandomAccessFile {
 
   Result<std::string_view> Read(uint64_t offset, size_t n, char* scratch) const;
 
+  FileHandle handle() const { return handle_; }
+
  private:
   FileHandle handle_;
 };

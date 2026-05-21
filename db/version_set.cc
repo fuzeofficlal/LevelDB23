@@ -181,12 +181,12 @@ void Version::ForEachOverlapping(std::string_view user_key, std::string_view int
   }
 }
 
-Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
-                                                const LookupKey& k, GetStats* stats) {
+Result<std::optional<PinnableValue>> Version::Get(const ReadOptions& options,
+                                                 const LookupKey& k, GetStats* stats) {
   stats->seek_file = nullptr;
   stats->seek_file_level = -1;
 
-  std::optional<std::string> result;
+  std::optional<PinnableValue> result;
   Status s;
   bool found = false;
 
@@ -205,7 +205,7 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
     bool file_found = false;
     auto get_res = vset_->table_cache_->Get(
         options, f->number, f->file_size, k.internal_key(),
-        [&](std::string_view ikey, std::string_view v) {
+        [&](std::string_view ikey, PinnableValue v) {
           auto opt_key = ParseInternalKey(ikey);
           if (!opt_key) {
             s = Status::Corruption("corrupted key for " + std::string(k.user_key()));
@@ -215,7 +215,7 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
             ParsedInternalKey parsed_key = *opt_key;
             if (vset_->icmp_.user_comparator()->Compare(parsed_key.user_key, k.user_key()) == 0) {
               if (parsed_key.type == kTypeValue) {
-                result = std::string(v);
+                result = std::move(v);
               } else {
                 result = std::nullopt; // Deleted
               }
@@ -242,7 +242,7 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
   
   if (found) {
     if (result) {
-      return *result;
+      return std::move(*result);
     } else {
       return std::unexpected(Status::NotFoundErr("deleted"));
     }
@@ -252,7 +252,7 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
 }
 
 bool Version::GetFast(const ReadOptions& options, const LookupKey& k, GetStats* stats,
-                      std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+                      std::move_only_function<void(std::string_view, PinnableValue)> handle_result,
                       bool* found_out) {
   stats->seek_file = nullptr;
   stats->seek_file_level = -1;
@@ -281,8 +281,8 @@ bool Version::GetFast(const ReadOptions& options, const LookupKey& k, GetStats* 
     bool file_found = false;
     bool success = vset_->table_cache_->GetFast(
         options, f->number, f->file_size, k.internal_key(),
-        [&](std::string_view ikey, std::string_view v) {
-          handle_result(ikey, v);
+        [&](std::string_view ikey, PinnableValue v) {
+          handle_result(ikey, std::move(v));
           file_found = true;
           found = true;
         });
@@ -300,12 +300,12 @@ bool Version::GetFast(const ReadOptions& options, const LookupKey& k, GetStats* 
   return true; // Successfully checked all levels synchronously
 }
 
-Task<Result<std::optional<std::string>>> Version::GetAsync(
+Task<Result<std::optional<PinnableValue>>> Version::GetAsync(
     const ReadOptions& options, const LookupKey& k, GetStats* stats, AsyncExecutor* executor) {
   stats->seek_file = nullptr;
   stats->seek_file_level = -1;
 
-  std::optional<std::string> result;
+  std::optional<PinnableValue> result;
   Status s;
   bool found = false;
 
@@ -330,7 +330,7 @@ Task<Result<std::optional<std::string>>> Version::GetAsync(
     bool file_found = false;
     auto get_res = co_await vset_->table_cache_->GetAsync(
         options, f->number, f->file_size, k.internal_key(),
-        [&](std::string_view ikey, std::string_view v) {
+        [&](std::string_view ikey, PinnableValue v) {
           auto opt_key = ParseInternalKey(ikey);
           if (!opt_key) {
             s = Status::Corruption("corrupted key for " + std::string(k.user_key()));
@@ -340,7 +340,7 @@ Task<Result<std::optional<std::string>>> Version::GetAsync(
             ParsedInternalKey parsed_key = *opt_key;
             if (vset_->icmp_.user_comparator()->Compare(parsed_key.user_key, k.user_key()) == 0) {
               if (parsed_key.type == kTypeValue) {
-                result = std::string(v);
+                result = std::move(v);
               } else {
                 result = std::nullopt; // Deleted
               }
@@ -368,7 +368,7 @@ Task<Result<std::optional<std::string>>> Version::GetAsync(
   
   if (found) {
     if (result) {
-      co_return *result;
+      co_return std::move(*result);
     } else {
       co_return std::unexpected(Status::NotFoundErr("deleted"));
     }

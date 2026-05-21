@@ -217,8 +217,10 @@ char* leveldb_get(leveldb_t* db, const leveldb_readoptions_t* options,
   auto s = db->rep->Get(options->rep, std::string_view(key, keylen));
   if (s) {
     if (s->has_value()) {
-      *vallen = (*s)->size();
-      result = CopyString(**s);
+      std::string_view sv = (*s)->value();
+      *vallen = sv.size();
+      result = reinterpret_cast<char*>(std::malloc(sv.size()));
+      std::memcpy(result, sv.data(), sv.size());
     } else {
       *vallen = 0;
     }

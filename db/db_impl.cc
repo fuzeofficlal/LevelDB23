@@ -49,7 +49,7 @@ DBImpl::DBImpl(const Options<StdFileSystem>& options, std::string dbname)
       tmp_batch_(new WriteBatch),
       table_cache_(std::make_unique<TableCache>(dbname_, &options_, options_.max_open_files)),
       versions_(std::make_unique<VersionSet>(dbname_, &options_, table_cache_.get(), &internal_comparator_)),
-      async_executor_(4, options_.async_optimize) {}
+      async_executor_(4, options_.async_optimize, options_.lock_free_queue, options_.io_uring, options_.coro_allocator) {}
 
 DBImpl::~DBImpl() {
   shutting_down_ = true;
@@ -198,6 +198,7 @@ Task<Result<void>> DBImpl::WriteSyncHelper(DBImpl* db, const WriteOptions& optio
 }
 
 Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+  CoroAllocGuard guard(options_.coro_allocator);
   CoroutineWriter w;
   w.batch = updates;
   w.sync = options.sync;
@@ -215,6 +216,7 @@ Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
 }
 
 Task<Result<void>> DBImpl::WriteAsync(const WriteOptions& options, CoroutineWriter* w) {
+  CoroAllocGuard guard(options_.coro_allocator);
   co_await co_write_queue_.enqueue(w);
   
   if (w->done) {
@@ -370,14 +372,15 @@ WriteBatch* DBImpl::BuildBatchGroup(CoroutineWriter** last_writer) {
   return result;
 }
 
-Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& options,
-                                                          std::string_view key) {
+Task<Result<std::optional<PinnableValue>>> DBImpl::GetAsync(const ReadOptions& options,
+                                                           std::string_view key) {
+  CoroAllocGuard guard(options.coro_allocator);
   if (options.async_optimize) {
     auto fast_res = GetFast(options, key);
     if (fast_res) {
-      co_return fast_res;
+      co_return std::move(fast_res);
     } else if (fast_res.error().code() != StatusCode::kNotSupported || fast_res.error().message() != "cache miss") {
-      co_return fast_res;
+      co_return std::unexpected(fast_res.error());
     }
   }
 
@@ -398,12 +401,20 @@ Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& opt
   if (mem) {
     auto mem_res = mem->Get(lkey);
     if (!mem_res) co_return std::unexpected(mem_res.error());
-    if (*mem_res) co_return std::string(**mem_res);
+    if (*mem_res) {
+      PinnableValue pv;
+      pv.SetString(std::string(**mem_res));
+      co_return pv;
+    }
   }
   if (imm) {
     auto imm_res = imm->Get(lkey);
     if (!imm_res) co_return std::unexpected(imm_res.error());
-    if (*imm_res) co_return std::string(**imm_res);
+    if (*imm_res) {
+      PinnableValue pv;
+      pv.SetString(std::string(**imm_res));
+      co_return pv;
+    }
   }
   
   Version::GetStats stats;
@@ -418,7 +429,7 @@ Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& opt
   co_return v_res;
 }
 
-Result<std::optional<std::string>> DBImpl::GetFast(const ReadOptions& options,
+Result<std::optional<PinnableValue>> DBImpl::GetFast(const ReadOptions& options,
                                                    std::string_view key) {
   std::unique_lock<std::mutex> lk(mutex_);
 
@@ -437,20 +448,28 @@ Result<std::optional<std::string>> DBImpl::GetFast(const ReadOptions& options,
   if (mem) {
     auto mem_res = mem->Get(lkey);
     if (!mem_res) return std::unexpected(mem_res.error());
-    if (*mem_res) return std::string(**mem_res);
+    if (*mem_res) {
+      PinnableValue pv;
+      pv.SetString(std::string(**mem_res));
+      return pv;
+    }
   }
   if (imm) {
     auto imm_res = imm->Get(lkey);
     if (!imm_res) return std::unexpected(imm_res.error());
-    if (*imm_res) return std::string(**imm_res);
+    if (*imm_res) {
+      PinnableValue pv;
+      pv.SetString(std::string(**imm_res));
+      return pv;
+    }
   }
 
   Version::GetStats stats;
-  std::string value;
+  PinnableValue value;
   bool found_out = false;
   bool completed = current->GetFast(options, lkey, &stats,
-      [&](std::string_view ikey, std::string_view v) {
-        value.assign(v.data(), v.size());
+      [&](std::string_view ikey, PinnableValue v) {
+        value = std::move(v);
       },
       &found_out);
 
@@ -462,7 +481,7 @@ Result<std::optional<std::string>> DBImpl::GetFast(const ReadOptions& options,
       }
     }
     if (found_out) {
-      return value;
+      return std::move(value);
     } else {
       return std::unexpected(Status::NotFoundErr("not found"));
     }
@@ -471,25 +490,26 @@ Result<std::optional<std::string>> DBImpl::GetFast(const ReadOptions& options,
   return Status::NotSupportedErr("cache miss");
 }
 
-DBImpl::SyncTask DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
-                                       Result<std::optional<std::string>>& result) {
+DBImpl::SyncTask DBImpl::GetSyncHelper(Task<Result<std::optional<PinnableValue>>>& task,
+                                       Result<std::optional<PinnableValue>>& result) {
   result = co_await task;
   co_return;
 }
 
-Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
+Result<std::optional<PinnableValue>> DBImpl::Get(const ReadOptions& options,
                                                std::string_view key) {
+  CoroAllocGuard guard(options.coro_allocator);
   if (options.async_optimize) {
     auto fast_res = GetFast(options, key);
     if (fast_res) {
-      return fast_res;
+      return std::move(fast_res);
     } else if (fast_res.error().code() != StatusCode::kNotSupported || fast_res.error().message() != "cache miss") {
-      return fast_res;
+      return std::unexpected(fast_res.error());
     }
   }
 
   std::binary_semaphore sem{0};
-  Result<std::optional<std::string>> result;
+  Result<std::optional<PinnableValue>> result;
 
   auto task = GetAsync(options, key);
   

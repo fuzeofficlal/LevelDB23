@@ -37,7 +37,7 @@ class Block {
   uint32_t NumRestarts() const;
 
   std::string_view data_;
-  std::unique_ptr<char[]> heap_data_;
+  std::shared_ptr<char[]> heap_data_;
   size_t size_;
   uint32_t restart_offset_;  // Offset in data_ of restart array
 };

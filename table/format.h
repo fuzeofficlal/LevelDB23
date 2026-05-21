@@ -11,13 +11,23 @@
 #include "leveldb/env.h"
 #include "leveldb/options.h"
 #include "leveldb/status.h"
+#include "leveldb/iterator.h"
+#include "leveldb/cache.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
 #include "util/compression.h"
+#include "db/co_task.h"
+#include "db/async_executor.h"
 
 namespace leveldb {
 
 class Block;
+
+struct BlockReaderResult {
+  std::unique_ptr<Iterator> iter;
+  std::shared_ptr<Cache::CacheHandle> cache_handle = nullptr;
+  std::shared_ptr<char[]> heap_data = nullptr;
+};
 
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
@@ -82,7 +92,7 @@ inline constexpr size_t kBlockTrailerSize = 5;
 struct BlockContents {
   std::string_view data;         // Actual contents of data
   bool cachable = false;         // True iff data can be cached
-  std::unique_ptr<char[]> heap_data = nullptr; // True iff caller should delete[] data.data()
+  std::shared_ptr<char[]> heap_data = nullptr; // Shared ownership of data.data()
 };
 
 // Read the block identified by "handle" from "file".
@@ -93,7 +103,7 @@ Result<BlockContents> ReadBlock(const File* file, const ReadOptions& options,
   // Read the block contents as well as the type/crc footer.
   // See table_builder.cc for the code that built this structure.
   size_t n = static_cast<size_t>(handle.size());
-  auto buf = std::make_unique<char[]>(n + kBlockTrailerSize);
+  auto buf = std::make_shared<char[]>(n + kBlockTrailerSize);
   
   auto read_res = file->Read(handle.offset(), n + kBlockTrailerSize, buf.get());
   if (!read_res) {
@@ -127,7 +137,7 @@ Result<BlockContents> ReadBlock(const File* file, const ReadOptions& options,
         result.cachable = false;  // Do not double-cache
       } else {
         result.data = std::string_view(buf.get(), n);
-        result.heap_data = std::move(buf);
+        result.heap_data = buf;
         result.cachable = true;
       }
       break;
@@ -137,12 +147,12 @@ Result<BlockContents> ReadBlock(const File* file, const ReadOptions& options,
       if (!ulength) {
         return Status::CorruptionErr("corrupted snappy compressed block length");
       }
-      auto ubuf = std::make_unique<char[]>(*ulength);
+      auto ubuf = std::make_shared<char[]>(*ulength);
       if (!Snappy_Uncompress(std::string_view(data, n), ubuf.get())) {
         return Status::CorruptionErr("corrupted snappy compressed block contents");
       }
       result.data = std::string_view(ubuf.get(), *ulength);
-      result.heap_data = std::move(ubuf);
+      result.heap_data = ubuf;
       result.cachable = true;
       break;
     }
@@ -152,12 +162,12 @@ Result<BlockContents> ReadBlock(const File* file, const ReadOptions& options,
       if (!ulength) {
         return Status::CorruptionErr("corrupted zstd compressed block length");
       }
-      auto ubuf = std::make_unique<char[]>(*ulength);
+      auto ubuf = std::make_shared<char[]>(*ulength);
       if (!Zstd_Uncompress(std::string_view(data, n), ubuf.get())) {
         return Status::CorruptionErr("corrupted zstd compressed block contents");
       }
       result.data = std::string_view(ubuf.get(), *ulength);
-      result.heap_data = std::move(ubuf);
+      result.heap_data = ubuf;
       result.cachable = true;
       break;
     }
@@ -167,6 +177,109 @@ Result<BlockContents> ReadBlock(const File* file, const ReadOptions& options,
   }
 
   return result;
+}
+
+// Read block asynchronously using io_uring if enabled, otherwise falls back to executor pool.
+template <CRandomAccessFile File>
+Task<Result<BlockContents>> ReadBlockAsync(const File* file, const ReadOptions& options,
+                                           const BlockHandle& handle, AsyncExecutor* executor) {
+  size_t n = static_cast<size_t>(handle.size());
+  auto buf = std::make_shared<char[]>(n + kBlockTrailerSize);
+  
+  std::string_view contents;
+  if (options.io_uring && executor->is_io_uring_enabled()) {
+    int fd = -1;
+    if constexpr (requires(const File& f) { { f.handle() } -> std::convertible_to<int>; }) {
+      fd = file->handle();
+    }
+    if (fd != -1) {
+      auto read_res = co_await executor->ReadAsync(fd, handle.offset(), n + kBlockTrailerSize, buf.get());
+      if (!read_res) {
+        co_return std::unexpected(read_res.error());
+      }
+      contents = *read_res;
+    } else {
+      auto read_res = co_await executor->submit([file, &handle, n, buf_ptr = buf.get()]() {
+        return file->Read(handle.offset(), n + kBlockTrailerSize, buf_ptr);
+      });
+      if (!read_res) {
+        co_return std::unexpected(read_res.error());
+      }
+      contents = *read_res;
+    }
+  } else {
+    auto read_res = co_await executor->submit([file, &handle, n, buf_ptr = buf.get()]() {
+      return file->Read(handle.offset(), n + kBlockTrailerSize, buf_ptr);
+    });
+    if (!read_res) {
+      co_return std::unexpected(read_res.error());
+    }
+    contents = *read_res;
+  }
+
+  if (contents.size() != n + kBlockTrailerSize) {
+    co_return std::unexpected(Status::CorruptionErr("truncated block read"));
+  }
+
+  // Check the crc of the type and the block contents
+  const char* data = contents.data();  // Pointer to where Read put the data
+  if (options.verify_checksums) {
+    const uint32_t crc = crc32c::Unmask(DecodeFixed32(data + n + 1));
+    const uint32_t actual = crc32c::Value(std::string_view(data, n + 1));
+    if (actual != crc) {
+      co_return std::unexpected(Status::CorruptionErr("block checksum mismatch"));
+    }
+  }
+
+  BlockContents result;
+  switch (static_cast<CompressionType>(data[n])) {
+    case CompressionType::kNoCompression:
+      if (data != buf.get()) {
+        result.data = std::string_view(data, n);
+        result.heap_data = nullptr;
+        result.cachable = false;
+      } else {
+        result.data = std::string_view(buf.get(), n);
+        result.heap_data = buf;
+        result.cachable = true;
+      }
+      break;
+      
+    case CompressionType::kSnappyCompression: {
+      auto ulength = Snappy_GetUncompressedLength(std::string_view(data, n));
+      if (!ulength) {
+        co_return std::unexpected(Status::CorruptionErr("corrupted snappy compressed block length"));
+      }
+      auto ubuf = std::make_shared<char[]>(*ulength);
+      if (!Snappy_Uncompress(std::string_view(data, n), ubuf.get())) {
+        co_return std::unexpected(Status::CorruptionErr("corrupted snappy compressed block contents"));
+      }
+      result.data = std::string_view(ubuf.get(), *ulength);
+      result.heap_data = ubuf;
+      result.cachable = true;
+      break;
+    }
+    
+    case CompressionType::kZstdCompression: {
+      auto ulength = Zstd_GetUncompressedLength(std::string_view(data, n));
+      if (!ulength) {
+        co_return std::unexpected(Status::CorruptionErr("corrupted zstd compressed block length"));
+      }
+      auto ubuf = std::make_shared<char[]>(*ulength);
+      if (!Zstd_Uncompress(std::string_view(data, n), ubuf.get())) {
+        co_return std::unexpected(Status::CorruptionErr("corrupted zstd compressed block contents"));
+      }
+      result.data = std::string_view(ubuf.get(), *ulength);
+      result.heap_data = ubuf;
+      result.cachable = true;
+      break;
+    }
+    
+    default:
+      co_return std::unexpected(Status::CorruptionErr("bad block type"));
+  }
+
+  co_return result;
 }
 
 // Implementation details follow.  Clients should ignore,

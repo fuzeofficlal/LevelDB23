@@ -22,7 +22,6 @@ template <CRandomAccessFile SrcFile>
 struct Table<SrcFile>::Rep {
   ~Rep() {
     delete filter;
-    delete[] filter_data;
   }
 
   TableOptions options;
@@ -30,7 +29,7 @@ struct Table<SrcFile>::Rep {
   SrcFile* file;
   uint64_t cache_id;
   FilterBlockReader* filter;
-  const char* filter_data;
+  std::shared_ptr<char[]> filter_data;
 
   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
   std::unique_ptr<Block> index_block;
@@ -122,8 +121,8 @@ void Table<SrcFile>::ReadFilter(std::string_view filter_handle_value) {
   }
   auto& block = *block_res;
   if (block.heap_data) {
-    rep_->filter_data = block.heap_data.release();  // Will need to delete later
-    rep_->filter = new FilterBlockReader(rep_->options.filter_policy, std::string_view(rep_->filter_data, block.data.size()));
+    rep_->filter_data = block.heap_data;
+    rep_->filter = new FilterBlockReader(rep_->options.filter_policy, std::string_view(rep_->filter_data.get(), block.data.size()));
   } else {
     rep_->filter = new FilterBlockReader(rep_->options.filter_policy, block.data);
   }
@@ -133,11 +132,12 @@ template <CRandomAccessFile SrcFile>
 Table<SrcFile>::~Table() { delete rep_; }
 
 template <CRandomAccessFile SrcFile>
-std::unique_ptr<Iterator> Table<SrcFile>::BlockReader(
+BlockReaderResult Table<SrcFile>::BlockReader(
     const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value) {
   Cache* block_cache = table->rep_->options.block_cache;
   std::unique_ptr<Block> block;
   Cache::CacheHandle cache_handle;
+  std::shared_ptr<char[]> heap_data = nullptr;
 
   BlockHandle handle;
   std::string_view input = index_value;
@@ -155,6 +155,7 @@ std::unique_ptr<Iterator> Table<SrcFile>::BlockReader(
       } else {
         auto contents = ReadBlock(table->rep_->file, options, handle);
         if (contents) {
+          heap_data = contents->heap_data;
           block = std::make_unique<Block>(std::move(*contents));
           if (contents->cachable && options.fill_cache) {
             Block* raw_block = block.release();
@@ -171,6 +172,7 @@ std::unique_ptr<Iterator> Table<SrcFile>::BlockReader(
     } else {
       auto contents = ReadBlock(table->rep_->file, options, handle);
       if (contents) {
+        heap_data = contents->heap_data;
         block = std::make_unique<Block>(std::move(*contents));
       } else {
         s = std::unexpected(contents.error());
@@ -179,6 +181,7 @@ std::unique_ptr<Iterator> Table<SrcFile>::BlockReader(
   }
 
   std::unique_ptr<Iterator> iter;
+  std::shared_ptr<Cache::CacheHandle> shared_cache_handle = nullptr;
   if (block != nullptr) {
     iter = block->NewIterator(table->rep_->options.comparator);
     if (!cache_handle) {
@@ -186,12 +189,13 @@ std::unique_ptr<Iterator> Table<SrcFile>::BlockReader(
       iter->RegisterCleanup([raw_block]() { delete raw_block; });
     } else {
       block.release();
-      iter->RegisterCleanup([h = std::move(cache_handle)]() {});
+      shared_cache_handle = std::make_shared<Cache::CacheHandle>(std::move(cache_handle));
+      iter->RegisterCleanup([h = shared_cache_handle]() {});
     }
   } else {
     iter.reset(NewErrorIterator(s));
   }
-  return iter;
+  return BlockReaderResult{std::move(iter), std::move(shared_cache_handle), std::move(heap_data)};
 }
 
 template <CRandomAccessFile SrcFile>
@@ -199,14 +203,14 @@ std::unique_ptr<Iterator> Table<SrcFile>::NewIterator(const ReadOptions& options
   return NewTwoLevelIterator(
       rep_->index_block->NewIterator(rep_->options.comparator),
       [this](const ReadOptions& opts, std::string_view index_value) {
-        return BlockReader(this, opts, index_value);
+        return BlockReader(this, opts, index_value).iter;
       },
       options);
 }
 
 template <CRandomAccessFile SrcFile>
 Result<void> Table<SrcFile>::InternalGet(const ReadOptions& options, std::string_view k,
-                                         std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+                                         std::move_only_function<void(std::string_view, PinnableValue)> handle_result) {
   Result<void> s;
   auto iiter = rep_->index_block->NewIterator(rep_->options.comparator);
   iiter->Seek(k);
@@ -219,12 +223,26 @@ Result<void> Table<SrcFile>::InternalGet(const ReadOptions& options, std::string
         !filter->KeyMayMatch(handle.offset(), k)) {
       // Not found
     } else {
-      auto block_iter = BlockReader(this, options, handle_value);
-      block_iter->Seek(k);
-      if (block_iter->Valid()) {
-        handle_result(block_iter->key(), block_iter->value());
+      auto block_res = BlockReader(this, options, handle_value);
+      if (block_res.iter) {
+        block_res.iter->Seek(k);
+        if (block_res.iter->Valid()) {
+          PinnableValue pinnable_val;
+          if (options.zero_copy) {
+            pinnable_val.SetView(block_res.iter->value());
+            if (block_res.cache_handle) {
+              pinnable_val.PinCache(block_res.cache_handle);
+            }
+            if (block_res.heap_data) {
+              pinnable_val.PinHeap(block_res.heap_data);
+            }
+          } else {
+            pinnable_val.SetString(std::string(block_res.iter->value()));
+          }
+          handle_result(block_res.iter->key(), std::move(pinnable_val));
+        }
+        s = block_res.iter->status();
       }
-      s = block_iter->status();
     }
   }
   if (s) {
@@ -235,7 +253,7 @@ Result<void> Table<SrcFile>::InternalGet(const ReadOptions& options, std::string
 
 template <CRandomAccessFile SrcFile>
 bool Table<SrcFile>::InternalGetFast(const ReadOptions& options, std::string_view key,
-                                     std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+                                     std::move_only_function<void(std::string_view, PinnableValue)> handle_result) {
   auto iiter = rep_->index_block->NewIterator(rep_->options.comparator);
   iiter->Seek(key);
   bool completed = false;
@@ -261,7 +279,14 @@ bool Table<SrcFile>::InternalGetFast(const ReadOptions& options, std::string_vie
           auto block_iter = block->NewIterator(rep_->options.comparator);
           block_iter->Seek(key);
           if (block_iter->Valid()) {
-            handle_result(block_iter->key(), block_iter->value());
+            PinnableValue pinnable_val;
+            if (options.zero_copy) {
+              pinnable_val.SetView(block_iter->value());
+              pinnable_val.PinCache(std::make_shared<Cache::CacheHandle>(std::move(cache_handle)));
+            } else {
+              pinnable_val.SetString(std::string(block_iter->value()));
+            }
+            handle_result(block_iter->key(), std::move(pinnable_val));
           }
           completed = true;
         }
@@ -297,7 +322,7 @@ uint64_t Table<SrcFile>::ApproximateOffsetOf(std::string_view key) const {
 template <CRandomAccessFile SrcFile>
 Task<Result<void>> Table<SrcFile>::InternalGetAsync(
     const ReadOptions& options, std::string_view key,
-    std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+    std::move_only_function<void(std::string_view, PinnableValue)> handle_result,
     AsyncExecutor* executor) {
   Result<void> s;
   auto iiter = rep_->index_block->NewIterator(rep_->options.comparator);
@@ -311,16 +336,30 @@ Task<Result<void>> Table<SrcFile>::InternalGetAsync(
         !filter->KeyMayMatch(handle.offset(), key)) {
       // Not found
     } else {
-      auto block_iter_res = co_await BlockReaderAsync(this, options, handle_value, executor);
-      if (block_iter_res) {
-        auto& block_iter = *block_iter_res;
-        block_iter->Seek(key);
-        if (block_iter->Valid()) {
-          handle_result(block_iter->key(), block_iter->value());
+      auto block_res = co_await BlockReaderAsync(this, options, handle_value, executor);
+      if (block_res) {
+        auto& block_res_val = *block_res;
+        if (block_res_val.iter) {
+          block_res_val.iter->Seek(key);
+          if (block_res_val.iter->Valid()) {
+            PinnableValue pinnable_val;
+            if (options.zero_copy) {
+              pinnable_val.SetView(block_res_val.iter->value());
+              if (block_res_val.cache_handle) {
+                pinnable_val.PinCache(block_res_val.cache_handle);
+              }
+              if (block_res_val.heap_data) {
+                pinnable_val.PinHeap(block_res_val.heap_data);
+              }
+            } else {
+              pinnable_val.SetString(std::string(block_res_val.iter->value()));
+            }
+            handle_result(block_res_val.iter->key(), std::move(pinnable_val));
+          }
+          s = block_res_val.iter->status();
         }
-        s = block_iter->status();
       } else {
-        s = std::unexpected(block_iter_res.error());
+        s = std::unexpected(block_res.error());
       }
     }
   }
@@ -331,12 +370,13 @@ Task<Result<void>> Table<SrcFile>::InternalGetAsync(
 }
 
 template <CRandomAccessFile SrcFile>
-Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
+Task<Result<BlockReaderResult>> Table<SrcFile>::BlockReaderAsync(
     const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value,
     AsyncExecutor* executor) {
   Cache* block_cache = table->rep_->options.block_cache;
   std::unique_ptr<Block> block;
   Cache::CacheHandle cache_handle;
+  std::shared_ptr<char[]> heap_data = nullptr;
 
   BlockHandle handle;
   std::string_view input = index_value;
@@ -352,10 +392,9 @@ Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
       if (cache_handle) {
         block.reset(reinterpret_cast<Block*>(block_cache->Value(cache_handle.get())));
       } else {
-        auto contents_res = co_await executor->submit([table, options, handle]() {
-          return ReadBlock(table->rep_->file, options, handle);
-        });
+        auto contents_res = co_await ReadBlockAsync(table->rep_->file, options, handle, executor);
         if (contents_res) {
+          heap_data = contents_res->heap_data;
           block = std::make_unique<Block>(std::move(*contents_res));
           if (contents_res->cachable && options.fill_cache) {
             Block* raw_block = block.release();
@@ -370,10 +409,9 @@ Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
         }
       }
     } else {
-      auto contents_res = co_await executor->submit([table, options, handle]() {
-        return ReadBlock(table->rep_->file, options, handle);
-      });
+      auto contents_res = co_await ReadBlockAsync(table->rep_->file, options, handle, executor);
       if (contents_res) {
+        heap_data = contents_res->heap_data;
         block = std::make_unique<Block>(std::move(*contents_res));
       } else {
         s = std::unexpected(contents_res.error());
@@ -382,6 +420,7 @@ Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
   }
 
   std::unique_ptr<Iterator> iter;
+  std::shared_ptr<Cache::CacheHandle> shared_cache_handle = nullptr;
   if (block != nullptr) {
     iter = block->NewIterator(table->rep_->options.comparator);
     if (!cache_handle) {
@@ -389,12 +428,13 @@ Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
       iter->RegisterCleanup([raw_block]() { delete raw_block; });
     } else {
       block.release();
-      iter->RegisterCleanup([h = std::move(cache_handle)]() {});
+      shared_cache_handle = std::make_shared<Cache::CacheHandle>(std::move(cache_handle));
+      iter->RegisterCleanup([h = shared_cache_handle]() {});
     }
   } else {
     iter.reset(NewErrorIterator(s));
   }
-  co_return iter;
+  co_return BlockReaderResult{std::move(iter), std::move(shared_cache_handle), std::move(heap_data)};
 }
 
 }  // namespace leveldb

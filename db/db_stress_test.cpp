@@ -1,6 +1,10 @@
 #include "include/leveldb/db.h"
 
 bool g_async_optimize = false;
+bool g_coro_allocator = false;
+bool g_lock_free_queue = false;
+bool g_io_uring = false;
+bool g_zero_copy = false;
 #include "include/leveldb/options.h"
 #include "include/leveldb/write_batch.h"
 #include "include/leveldb/std_file_system.h"
@@ -33,6 +37,10 @@ void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 1: Concurrency & Lock Contention] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.env = &fs;
   
@@ -94,7 +102,11 @@ void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
   for (int i = 0; i < num_readers; ++i) {
     readers.emplace_back([&db, num_writers, ops_per_writer, &stop_readers, &total_reads, &read_errors]() {
       leveldb::ReadOptions ropt;
-  ropt.async_optimize = g_async_optimize;
+      ropt.async_optimize = g_async_optimize;
+      ropt.coro_allocator = g_coro_allocator;
+      ropt.lock_free_queue = g_lock_free_queue;
+      ropt.io_uring = g_io_uring;
+      ropt.zero_copy = g_zero_copy;
       std::mt19937 rng(1337 + total_reads.load());
       std::uniform_int_distribution<int> dist_thread(0, num_writers - 1);
       std::uniform_int_distribution<int> dist_key(0, ops_per_writer - 1);
@@ -137,6 +149,10 @@ void RunWALRecoveryStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 2: Crash Recovery & WAL Integrity] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.env = &fs;
   options.write_buffer_size = 128 * 1024 * 1024; // 128MB so everything stays in MemTable / WAL
@@ -186,7 +202,11 @@ void RunWALRecoveryStressTest(leveldb::StdFileSystem& fs) {
 
     cout << "  Verifying all " << num_keys << " recovered keys...\n" << std::flush;
     leveldb::ReadOptions ropt;
-  ropt.async_optimize = g_async_optimize;
+    ropt.async_optimize = g_async_optimize;
+    ropt.coro_allocator = g_coro_allocator;
+    ropt.lock_free_queue = g_lock_free_queue;
+    ropt.io_uring = g_io_uring;
+    ropt.zero_copy = g_zero_copy;
     int recovered_keys = 0;
     for (int i = 0; i < num_keys; ++i) {
       string key = "wal_key_" + to_string(i);
@@ -206,6 +226,10 @@ void RunCompactionIteratorStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 3: Compaction & Iterator Stability] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.write_buffer_size = 512 * 1024; // Small 512KB memtable to force very frequent compactions
   options.env = &fs;
@@ -225,7 +249,11 @@ void RunCompactionIteratorStressTest(leveldb::StdFileSystem& fs) {
   // Thread 1: Continuously create iterators, perform forward/backward scans under background compaction
   thread scanner([&db, &stop_threads, &iter_scans]() {
     leveldb::ReadOptions ropt;
-  ropt.async_optimize = g_async_optimize;
+    ropt.async_optimize = g_async_optimize;
+    ropt.coro_allocator = g_coro_allocator;
+    ropt.lock_free_queue = g_lock_free_queue;
+    ropt.io_uring = g_io_uring;
+    ropt.zero_copy = g_zero_copy;
     while (!stop_threads.load(std::memory_order_relaxed)) {
       auto snapshot = db->GetSnapshot();
       ropt.snapshot = snapshot.get();
@@ -288,6 +316,10 @@ void RunLifecycleLeakStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 4: Lifecycle & Leak Prevention] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.env = &fs;
 
@@ -315,7 +347,11 @@ void RunLifecycleLeakStressTest(leveldb::StdFileSystem& fs) {
     }
     
     leveldb::ReadOptions ropt;
-  ropt.async_optimize = g_async_optimize;
+    ropt.async_optimize = g_async_optimize;
+    ropt.coro_allocator = g_coro_allocator;
+    ropt.lock_free_queue = g_lock_free_queue;
+    ropt.io_uring = g_io_uring;
+    ropt.zero_copy = g_zero_copy;
     for (int j = 0; j < 1000; ++j) {
       auto res = db->Get(ropt, "key_" + to_string(j));
       assert(res && *res && **res == "val_" + to_string(j));
@@ -379,6 +415,10 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 5: Realistic Large-Scale Ingestion & Queries] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.write_buffer_size = 1024 * 1024; // 1MB memtable buffer to trigger frequent flushes
   options.env = &fs;
@@ -431,6 +471,10 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   auto start_read = chrono::high_resolution_clock::now();
   leveldb::ReadOptions ropt;
   ropt.async_optimize = g_async_optimize;
+  ropt.coro_allocator = g_coro_allocator;
+  ropt.lock_free_queue = g_lock_free_queue;
+  ropt.io_uring = g_io_uring;
+  ropt.zero_copy = g_zero_copy;
   int found_count = 0;
 
   for (int i = 0; i < num_lookups; ++i) {
@@ -502,6 +546,10 @@ void RunRepairStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 6: Database Repair (RepairDB)] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.async_optimize = g_async_optimize;
+  options.coro_allocator = g_coro_allocator;
+  options.lock_free_queue = g_lock_free_queue;
+  options.io_uring = g_io_uring;
+  options.zero_copy = g_zero_copy;
   options.create_if_missing = true;
   options.env = &fs;
 
@@ -551,6 +599,10 @@ void RunRepairStressTest(leveldb::StdFileSystem& fs) {
   auto db = std::move(*db_res);
   leveldb::ReadOptions ropt;
   ropt.async_optimize = g_async_optimize;
+  ropt.coro_allocator = g_coro_allocator;
+  ropt.lock_free_queue = g_lock_free_queue;
+  ropt.io_uring = g_io_uring;
+  ropt.zero_copy = g_zero_copy;
   int recovered_keys = 0;
   for (int i = 0; i < num_keys; ++i) {
     auto get_res = db->Get(ropt, "repair_key_" + to_string(i));
@@ -564,17 +616,28 @@ void RunRepairStressTest(leveldb::StdFileSystem& fs) {
 }
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::string(argv[1]) == "--async_optimize") {
-    g_async_optimize = true;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--async_optimize") {
+      g_async_optimize = true;
+    } else if (arg == "--coro_allocator") {
+      g_coro_allocator = true;
+    } else if (arg == "--lock_free_queue") {
+      g_lock_free_queue = true;
+    } else if (arg == "--io_uring") {
+      g_io_uring = true;
+    } else if (arg == "--zero_copy") {
+      g_zero_copy = true;
+    }
   }
 
   cout << "========================================================\n";
   cout << "        LevelDB-23 Full Pipeline Stress Test Suite       \n";
-  if (g_async_optimize) {
-    cout << "               (ASYNC OPTIMIZED PATH ENABLED)            \n";
-  } else {
-    cout << "               (DEFAULT / UNOPTIMIZED PATH)              \n";
-  }
+  cout << "  async_optimize:  " << (g_async_optimize ? "ON" : "OFF") << "\n";
+  cout << "  coro_allocator:  " << (g_coro_allocator ? "ON" : "OFF") << "\n";
+  cout << "  lock_free_queue: " << (g_lock_free_queue ? "ON" : "OFF") << "\n";
+  cout << "  io_uring:        " << (g_io_uring ? "ON" : "OFF") << "\n";
+  cout << "  zero_copy:       " << (g_zero_copy ? "ON" : "OFF") << "\n";
   cout << "========================================================\n";
 
   leveldb::StdFileSystem fs;

@@ -8,11 +8,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <ostream>
 
 #include "leveldb/iterator.h"
 #include "leveldb/options.h"
 #include "leveldb/status.h"
 #include "leveldb/std_file_system.h" // Default FS
+#include "leveldb/cache.h"
 
 namespace leveldb {
 
@@ -40,6 +42,89 @@ struct Range {
   std::string_view limit;  // Not included in the range
 };
 
+class PinnableValue {
+ public:
+  PinnableValue() = default;
+  PinnableValue(PinnableValue&& other) noexcept
+      : value_(other.value_),
+        cache_handle_(std::move(other.cache_handle_)),
+        heap_data_(std::move(other.heap_data_)),
+        string_fallback_(std::move(other.string_fallback_)) {
+    other.value_ = {};
+  }
+  
+  PinnableValue& operator=(PinnableValue&& other) noexcept {
+    if (this != &other) {
+      value_ = other.value_;
+      cache_handle_ = std::move(other.cache_handle_);
+      heap_data_ = std::move(other.heap_data_);
+      string_fallback_ = std::move(other.string_fallback_);
+      other.value_ = {};
+    }
+    return *this;
+  }
+  
+  PinnableValue(const PinnableValue&) = delete;
+  PinnableValue& operator=(const PinnableValue&) = delete;
+  
+  std::string_view value() const {
+    if (!string_fallback_.empty()) return string_fallback_;
+    return value_;
+  }
+  
+  operator std::string() const {
+    return std::string(value());
+  }
+  
+  operator std::string_view() const {
+    return value();
+  }
+  
+  bool operator==(const std::string& other) const {
+    return value() == other;
+  }
+  
+  bool operator==(std::string_view other) const {
+    return value() == other;
+  }
+  
+  bool operator==(const char* other) const {
+    return value() == other;
+  }
+  
+  void SetString(std::string s) {
+    string_fallback_ = std::move(s);
+    value_ = {};
+    cache_handle_.reset();
+    heap_data_.reset();
+  }
+  
+  void SetView(std::string_view v) {
+    value_ = v;
+    string_fallback_.clear();
+    cache_handle_.reset();
+    heap_data_.reset();
+  }
+  
+  void PinCache(std::shared_ptr<Cache::CacheHandle> handle) {
+    cache_handle_ = std::move(handle);
+  }
+  
+  void PinHeap(std::shared_ptr<char[]> heap) {
+    heap_data_ = std::move(heap);
+  }
+
+ private:
+  std::string_view value_;
+  std::shared_ptr<Cache::CacheHandle> cache_handle_;
+  std::shared_ptr<char[]> heap_data_;
+  std::string string_fallback_;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const PinnableValue& pv) {
+  return os << pv.value();
+}
+
 // A DB is a persistent ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
@@ -64,8 +149,8 @@ class DB {
   virtual Result<void> Write(const WriteOptions& options, WriteBatch* updates) = 0;
 
   // If there is no entry for "key", returns std::nullopt.
-  virtual Result<std::optional<std::string>> Get(const ReadOptions& options,
-                                                 std::string_view key) = 0;
+  virtual Result<std::optional<PinnableValue>> Get(const ReadOptions& options,
+                                                   std::string_view key) = 0;
 
   virtual std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) = 0;
 

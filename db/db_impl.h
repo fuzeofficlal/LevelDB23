@@ -18,6 +18,7 @@
 #include "leveldb/std_file_system.h"
 #include "db/snapshot.h"
 #include "db/async_executor.h"
+#include "db/coro_allocator.h"
 
 namespace leveldb {
 
@@ -40,7 +41,7 @@ class DBImpl : public DB {
                    std::string_view value) override;
   Result<void> Delete(const WriteOptions& options, std::string_view key) override;
   Result<void> Write(const WriteOptions& options, WriteBatch* updates) override;
-  Result<std::optional<std::string>> Get(const ReadOptions& options,
+  Result<std::optional<PinnableValue>> Get(const ReadOptions& options,
                                          std::string_view key) override;
   std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) override;
   std::shared_ptr<const Snapshot> GetSnapshot() override;
@@ -67,8 +68,8 @@ class DBImpl : public DB {
   Result<void> MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lk);
   WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
-  Task<Result<std::optional<std::string>>> GetAsync(const ReadOptions& options, std::string_view key);
-  Result<std::optional<std::string>> GetFast(const ReadOptions& options, std::string_view key);
+  Task<Result<std::optional<PinnableValue>>> GetAsync(const ReadOptions& options, std::string_view key);
+  Result<std::optional<PinnableValue>> GetFast(const ReadOptions& options, std::string_view key);
   static Task<Result<void>> WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w);
   struct SyncTask {
     struct promise_type {
@@ -90,6 +91,12 @@ class DBImpl : public DB {
       final_awaiter final_suspend() noexcept { return {}; }
       void return_void() {}
       void unhandled_exception() { std::terminate(); }
+      void* operator new(std::size_t size) {
+        return CoroAllocator::Allocate(size);
+      }
+      void operator delete(void* ptr, std::size_t size) noexcept {
+        CoroAllocator::Deallocate(ptr, size);
+      }
     };
     std::coroutine_handle<promise_type> handle;
     explicit SyncTask(std::coroutine_handle<promise_type> h) : handle(h) {}
@@ -108,8 +115,8 @@ class DBImpl : public DB {
     }
   };
 
-  static SyncTask GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
-                                Result<std::optional<std::string>>& result);
+  static SyncTask GetSyncHelper(Task<Result<std::optional<PinnableValue>>>& task,
+                                Result<std::optional<PinnableValue>>& result);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();

@@ -27,6 +27,7 @@ add_library(leveldb
         db/repair.cc
         db/c.cc
         db/dumpfile.cc
+        db/coro_allocator.cc
         include/leveldb/status.h
         include/leveldb/export.h
         util/coding.h
@@ -72,6 +73,10 @@ if (WIN32)
     # Windows doesn't need -pthread flag usually, but MSVC might need different flags if not using clang.
     # GCC/MinGW needs it.
     target_link_libraries(leveldb pthread)
+endif()
+
+if (UNIX AND NOT APPLE)
+    target_link_libraries(leveldb PRIVATE uring)
 endif()
 
 add_executable(LevelDB_23 main.cpp)

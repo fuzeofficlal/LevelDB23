@@ -65,7 +65,7 @@ std::unique_ptr<Iterator> TableCache::NewIterator(const ReadOptions& options,
 
 Result<void> TableCache::Get(const ReadOptions& options, uint64_t file_number,
                              uint64_t file_size, std::string_view k,
-                             std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+                             std::move_only_function<void(std::string_view, PinnableValue)> handle_result) {
   auto entry_res = FindTable(file_number, file_size);
   if (!entry_res) return std::unexpected(entry_res.error());
   
@@ -74,7 +74,7 @@ Result<void> TableCache::Get(const ReadOptions& options, uint64_t file_number,
 
 bool TableCache::GetFast(const ReadOptions& options, uint64_t file_number,
                          uint64_t file_size, std::string_view k,
-                         std::move_only_function<void(std::string_view, std::string_view)> handle_result) {
+                         std::move_only_function<void(std::string_view, PinnableValue)> handle_result) {
   std::shared_ptr<Entry> entry = nullptr;
   {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -92,7 +92,7 @@ bool TableCache::GetFast(const ReadOptions& options, uint64_t file_number,
 Task<Result<void>> TableCache::GetAsync(
     const ReadOptions& options, uint64_t file_number, uint64_t file_size,
     std::string_view k,
-    std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+    std::move_only_function<void(std::string_view, PinnableValue)> handle_result,
     AsyncExecutor* executor) {
   std::shared_ptr<Entry> entry = nullptr;
   {

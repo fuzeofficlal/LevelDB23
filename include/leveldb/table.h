@@ -12,6 +12,8 @@
 #include "leveldb/iterator.h"
 #include "leveldb/options.h"
 #include "leveldb/status.h"
+#include "leveldb/db.h"
+#include "table/format.h"
 
 namespace leveldb {
 
@@ -70,18 +72,18 @@ class Table {
   // Calls handle_result with the entry found after a call to Seek(key).
   Result<void> InternalGet(
       const ReadOptions& options, std::string_view key,
-      std::move_only_function<void(std::string_view, std::string_view)> handle_result);
+      std::move_only_function<void(std::string_view, PinnableValue)> handle_result);
 
   // Checks if the key is in the table using filter and block cache.
   // Returns true if handled synchronously (either found or not present in the block cache/filter).
   // Returns false if cache miss, requiring a physical read.
   bool InternalGetFast(
       const ReadOptions& options, std::string_view key,
-      std::move_only_function<void(std::string_view, std::string_view)> handle_result);
+      std::move_only_function<void(std::string_view, PinnableValue)> handle_result);
 
   Task<Result<void>> InternalGetAsync(
       const ReadOptions& options, std::string_view key,
-      std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+      std::move_only_function<void(std::string_view, PinnableValue)> handle_result,
       AsyncExecutor* executor);
 
  private:
@@ -89,10 +91,10 @@ class Table {
 
   explicit Table(Rep* rep) : rep_(rep) {}
 
-  static std::unique_ptr<Iterator> BlockReader(
+  static BlockReaderResult BlockReader(
       const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value);
 
-  static Task<Result<std::unique_ptr<Iterator>>> BlockReaderAsync(
+  static Task<Result<BlockReaderResult>> BlockReaderAsync(
       const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value,
       AsyncExecutor* executor);
 

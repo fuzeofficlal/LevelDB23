@@ -11,6 +11,7 @@
 
 #include "leveldb/status.h"
 #include "leveldb/write_batch.h"
+#include "db/coro_allocator.h"
 
 namespace leveldb {
 
@@ -52,6 +53,13 @@ class [[nodiscard]] Task {
 
     void unhandled_exception() {
       std::terminate();
+    }
+
+    void* operator new(std::size_t size) {
+      return CoroAllocator::Allocate(size);
+    }
+    void operator delete(void* ptr, std::size_t size) noexcept {
+      CoroAllocator::Deallocate(ptr, size);
     }
   };
 
@@ -134,6 +142,13 @@ class [[nodiscard]] Task<void> {
       } catch (...) {
         result = std::unexpected(Status::Corruption("Unknown exception in coroutine"));
       }
+    }
+
+    void* operator new(std::size_t size) {
+      return CoroAllocator::Allocate(size);
+    }
+    void operator delete(void* ptr, std::size_t size) noexcept {
+      CoroAllocator::Deallocate(ptr, size);
     }
   };
 
