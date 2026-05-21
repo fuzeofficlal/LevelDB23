@@ -399,24 +399,18 @@ Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& opt
   Version::GetStats stats;
   auto v_res = co_await current->GetAsync(options, lkey, &stats, &async_executor_);
   
-  bool have_stat_update = false;
+  lk.lock();
   if (current->UpdateStats(stats)) {
-    have_stat_update = true;
-  }
-  
-  if (have_stat_update) {
-    lk.lock();
     MaybeScheduleCompaction();
   }
+  lk.unlock();
   
   co_return v_res;
 }
 
-Task<void> DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
-                                 Result<std::optional<std::string>>& result,
-                                 std::binary_semaphore& sem) {
+DBImpl::SyncTask DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
+                                       Result<std::optional<std::string>>& result) {
   result = co_await task;
-  sem.release();
   co_return;
 }
 
@@ -427,8 +421,9 @@ Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
 
   auto task = GetAsync(options, key);
   
-  auto t = GetSyncHelper(task, result, sem);
-  t.resume();
+  auto t = GetSyncHelper(task, result);
+  t.handle.promise().sem = &sem;
+  t.handle.resume();
 
   sem.acquire();
   return result;
@@ -436,6 +431,12 @@ Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
 
 void DBImpl::MaybeScheduleCompaction() {
   if (bg_compaction_scheduled_ || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!bg_error_.ok()) {
+    return;
+  }
+  if (imm_ == nullptr && manual_compaction_ == nullptr && !versions_->NeedsCompaction()) {
     return;
   }
   bg_compaction_scheduled_ = true;
@@ -453,6 +454,7 @@ void DBImpl::BackgroundCall() {
 
     BackgroundCompaction();
     bg_compaction_scheduled_ = false;
+    MaybeScheduleCompaction();
     background_work_finished_signal_.notify_all();
   }
 }

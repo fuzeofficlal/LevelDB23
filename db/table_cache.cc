@@ -14,12 +14,12 @@ TableCache::TableCache(const std::string& dbname, const Options<StdFileSystem>* 
 
 TableCache::~TableCache() = default;
 
-Result<TableCache::Entry*> TableCache::FindTable(uint64_t file_number, uint64_t file_size) {
+Result<std::shared_ptr<TableCache::Entry>> TableCache::FindTable(uint64_t file_number, uint64_t file_size) {
   {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = cache_.find(file_number);
     if (it != cache_.end()) {
-      return it->second.get();
+      return it->second;
     }
   }
 
@@ -35,16 +35,19 @@ Result<TableCache::Entry*> TableCache::FindTable(uint64_t file_number, uint64_t 
   auto table_res = Table<StdFileSystem::RandomAccessFile>::Open(table_options, file_ptr.get(), file_size);
   if (!table_res) return std::unexpected(table_res.error());
 
-  auto entry = std::make_unique<Entry>();
+  auto entry = std::make_shared<Entry>();
   entry->table = std::move(*table_res);
   entry->file = std::move(file_ptr);
   
-  auto* ptr = entry.get();
   {
     std::lock_guard<std::mutex> lk(mutex_);
-    cache_[file_number] = std::move(entry);
+    auto it = cache_.find(file_number);
+    if (it != cache_.end()) {
+      return it->second;
+    }
+    cache_[file_number] = entry;
   }
-  return ptr;
+  return entry;
 }
 
 std::unique_ptr<Iterator> TableCache::NewIterator(const ReadOptions& options,
@@ -54,7 +57,10 @@ std::unique_ptr<Iterator> TableCache::NewIterator(const ReadOptions& options,
   if (!entry_res) {
     return std::unique_ptr<Iterator>(NewErrorIterator(std::unexpected(entry_res.error())));
   }
-  return (*entry_res)->table->NewIterator(options);
+  auto entry = *entry_res;
+  auto iter = entry->table->NewIterator(options);
+  iter->RegisterCleanup([entry]() {});
+  return iter;
 }
 
 Result<void> TableCache::Get(const ReadOptions& options, uint64_t file_number,
@@ -71,17 +77,17 @@ Task<Result<void>> TableCache::GetAsync(
     std::string_view k,
     std::move_only_function<void(std::string_view, std::string_view)> handle_result,
     AsyncExecutor* executor) {
-  Entry* entry = nullptr;
+  std::shared_ptr<Entry> entry = nullptr;
   {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = cache_.find(file_number);
     if (it != cache_.end()) {
-      entry = it->second.get();
+      entry = it->second;
     }
   }
 
   if (entry == nullptr) {
-    auto entry_res = co_await executor->submit([this, file_number, file_size]() -> Result<Entry*> {
+    auto entry_res = co_await executor->submit([this, file_number, file_size]() -> Result<std::shared_ptr<Entry>> {
       return FindTable(file_number, file_size);
     });
     if (!entry_res) {

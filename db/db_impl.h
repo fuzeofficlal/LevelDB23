@@ -69,9 +69,46 @@ class DBImpl : public DB {
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
   Task<Result<std::optional<std::string>>> GetAsync(const ReadOptions& options, std::string_view key);
   static Task<Result<void>> WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w);
-  static Task<void> GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
-                                  Result<std::optional<std::string>>& result,
-                                  std::binary_semaphore& sem);
+  struct SyncTask {
+    struct promise_type {
+      std::binary_semaphore* sem = nullptr;
+      SyncTask get_return_object() {
+        return SyncTask{std::coroutine_handle<promise_type>::from_promise(*this)};
+      }
+      std::suspend_always initial_suspend() noexcept { return {}; }
+      struct final_awaiter {
+        bool await_ready() noexcept { return false; }
+        void await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+          auto* sem = h.promise().sem;
+          if (sem) {
+            sem->release();
+          }
+        }
+        void await_resume() noexcept {}
+      };
+      final_awaiter final_suspend() noexcept { return {}; }
+      void return_void() {}
+      void unhandled_exception() { std::terminate(); }
+    };
+    std::coroutine_handle<promise_type> handle;
+    explicit SyncTask(std::coroutine_handle<promise_type> h) : handle(h) {}
+    ~SyncTask() {
+      if (handle) handle.destroy();
+    }
+    SyncTask(const SyncTask&) = delete;
+    SyncTask& operator=(const SyncTask&) = delete;
+    SyncTask(SyncTask&& other) noexcept : handle(std::exchange(other.handle, nullptr)) {}
+    SyncTask& operator=(SyncTask&& other) noexcept {
+      if (this != &other) {
+        if (handle) handle.destroy();
+        handle = std::exchange(other.handle, nullptr);
+      }
+      return *this;
+    }
+  };
+
+  static SyncTask GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
+                                Result<std::optional<std::string>>& result);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();
