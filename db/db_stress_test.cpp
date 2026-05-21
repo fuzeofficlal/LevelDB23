@@ -3,6 +3,7 @@
 #include "include/leveldb/write_batch.h"
 #include "include/leveldb/std_file_system.h"
 #include "include/leveldb/status.h"
+#include "include/leveldb/cache.h"
 #include <iostream>
 #include <vector>
 #include <thread>
@@ -20,17 +21,20 @@ using namespace std;
 // Helper to format throughput
 void PrintThroughput(string_view label, uint64_t operations, chrono::microseconds duration) {
   double seconds = duration.count() / 1000000.0;
-  double ops_per_sec = operations / seconds;
+  double ops_per_sec = operations / (seconds > 0.0001 ? seconds : 0.0001);
   cout << label << ": " << operations << " ops in " << fixed << setprecision(3) 
        << seconds << "s (" << fixed << setprecision(0) << ops_per_sec << " ops/sec)\n";
 }
 
-// 1. Concurrency Stress Test
+// 1. Concurrency Stress Test (including Delete operations)
 void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
   cout << "\n--- [Stress Test 1: Concurrency & Lock Contention] ---\n";
   leveldb::Options<leveldb::StdFileSystem> options;
   options.create_if_missing = true;
   options.env = &fs;
+  
+  std::unique_ptr<leveldb::Cache> cache(leveldb::NewLRUCache(16 * 1024 * 1024)); // 16MB block cache
+  options.block_cache = cache.get();
   
   leveldb::DestroyDB("stress_db_concurrency", options);
   
@@ -43,7 +47,7 @@ void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
 
   const int num_writers = 8;
   const int num_readers = 4;
-  const int ops_per_writer = 2000;
+  const int ops_per_writer = 150000; // Increased to run ~5s
   std::atomic<bool> stop_readers{false};
   std::atomic<uint64_t> total_writes{0};
   std::atomic<uint64_t> total_reads{0};
@@ -52,19 +56,30 @@ void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
   auto start = chrono::high_resolution_clock::now();
 
   // Spawn writers
-  cout << "  Spawning " << num_writers << " concurrent writer threads...\n" << std::flush;
+  cout << "  Spawning " << num_writers << " concurrent writer threads (80% Puts, 20% Deletes)...\n" << std::flush;
   vector<thread> writers;
   for (int i = 0; i < num_writers; ++i) {
     writers.emplace_back([&db, i, ops_per_writer, &total_writes]() {
       leveldb::WriteOptions wopt;
+      std::mt19937 rng(42 + i);
+      std::uniform_int_distribution<int> op_dist(0, 99);
       for (int j = 0; j < ops_per_writer; ++j) {
         string key = "key_" + to_string(i) + "_" + to_string(j);
-        string val = "value_" + to_string(j) + "_content_padding_to_simulate_load";
-        auto res = db->Put(wopt, key, val);
-        if (!res) {
-          cerr << "Put error: " << res.error().ToString() << "\n";
+        if (op_dist(rng) < 20) {
+          auto res = db->Delete(wopt, key);
+          if (!res) {
+            cerr << "Delete error: " << res.error().ToString() << "\n";
+          } else {
+            total_writes++;
+          }
         } else {
-          total_writes++;
+          string val = "value_" + to_string(j) + "_content_padding_to_simulate_load";
+          auto res = db->Put(wopt, key, val);
+          if (!res) {
+            cerr << "Put error: " << res.error().ToString() << "\n";
+          } else {
+            total_writes++;
+          }
         }
       }
     });
@@ -107,8 +122,8 @@ void RunConcurrencyStressTest(leveldb::StdFileSystem& fs) {
   auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
   cout << "Writers: " << num_writers << ", Readers: " << num_readers << "\n";
-  PrintThroughput("  Writes", total_writes.load(), duration);
-  PrintThroughput("  Reads ", total_reads.load(), duration);
+  PrintThroughput("  Writes/Deletes", total_writes.load(), duration);
+  PrintThroughput("  Reads         ", total_reads.load(), duration);
   cout << "  Read Misses/Errors: " << read_errors.load() << "\n";
   cout << "Concurrency Stress Test: ✓ (Pass)\n";
 }
@@ -119,10 +134,11 @@ void RunWALRecoveryStressTest(leveldb::StdFileSystem& fs) {
   leveldb::Options<leveldb::StdFileSystem> options;
   options.create_if_missing = true;
   options.env = &fs;
+  options.write_buffer_size = 128 * 1024 * 1024; // 128MB so everything stays in MemTable / WAL
   
   leveldb::DestroyDB("stress_db_wal", options);
 
-  const int num_keys = 5000;
+  const int num_keys = 1000000; // Increased to run >= 5s
   
   // Scope 1: Write keys and destruct the DB without Manual Compaction (flushing memtable)
   {
@@ -132,6 +148,8 @@ void RunWALRecoveryStressTest(leveldb::StdFileSystem& fs) {
     
     leveldb::WriteOptions wopt;
     wopt.sync = false;
+    cout << "  Writing " << num_keys << " keys to MemTable/WAL...\n" << std::flush;
+    auto start = chrono::high_resolution_clock::now();
     for (int i = 0; i < num_keys; ++i) {
       string key = "wal_key_" + to_string(i);
       string val = "wal_value_" + to_string(i);
@@ -141,20 +159,27 @@ void RunWALRecoveryStressTest(leveldb::StdFileSystem& fs) {
         exit(1);
       }
     }
-    // DB is destructed here. Since it was not manually compacted, most data is still in the WAL log file.
-    cout << "  Simulated dirty shutdown (5,000 keys written to MemTable/WAL, database closed)\n";
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+    PrintThroughput("  Writes", num_keys, duration);
+    cout << "  Simulating dirty shutdown (database closed with unflushed MemTable)\n";
   }
 
   // Scope 2: Reopen DB and verify WAL recovery
   {
-    cout << "  Reopening database to trigger WAL replay...\n";
+    cout << "  Reopening database to trigger WAL replay...\n" << std::flush;
+    auto start = chrono::high_resolution_clock::now();
     auto db_res = leveldb::DB::Open(options, "stress_db_wal");
     if (!db_res) {
       cerr << "Failed to reopen DB: " << db_res.error().ToString() << "\n";
       exit(1);
     }
     auto db = std::move(*db_res);
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+    cout << "  WAL replay completed in " << fixed << setprecision(3) << duration.count() / 1000000.0 << "s\n";
 
+    cout << "  Verifying all " << num_keys << " recovered keys...\n" << std::flush;
     leveldb::ReadOptions ropt;
     int recovered_keys = 0;
     for (int i = 0; i < num_keys; ++i) {
@@ -178,6 +203,9 @@ void RunCompactionIteratorStressTest(leveldb::StdFileSystem& fs) {
   options.write_buffer_size = 512 * 1024; // Small 512KB memtable to force very frequent compactions
   options.env = &fs;
 
+  std::unique_ptr<leveldb::Cache> cache(leveldb::NewLRUCache(8 * 1024 * 1024)); // 8MB block cache
+  options.block_cache = cache.get();
+
   leveldb::DestroyDB("stress_db_compaction", options);
 
   auto db_res = leveldb::DB::Open(options, "stress_db_compaction");
@@ -200,7 +228,6 @@ void RunCompactionIteratorStressTest(leveldb::StdFileSystem& fs) {
       int forward_count = 0;
       iter->SeekToFirst();
       while (iter->Valid() && forward_count < 100) {
-        // Access key and value
         string_view k = iter->key();
         string_view v = iter->value();
         (void)k; (void)v;
@@ -226,9 +253,9 @@ void RunCompactionIteratorStressTest(leveldb::StdFileSystem& fs) {
   // Main Thread: Generate heavy write traffic with large values to trigger background compactions
   leveldb::WriteOptions wopt;
   string large_val(4096, 'a'); // 4KB values
-  const int total_writes = 1000;
+  const int total_writes = 30000; // Increased to run ~5s (120MB writes)
   
-  cout << "  Generating heavy compaction traffic (1,000 * 4KB writes)... \n";
+  cout << "  Generating heavy compaction traffic (" << total_writes << " * 4KB writes)... \n";
   auto start = chrono::high_resolution_clock::now();
   for (int i = 0; i < total_writes; ++i) {
     string key = "heavy_key_" + to_string(i);
@@ -255,9 +282,13 @@ void RunLifecycleLeakStressTest(leveldb::StdFileSystem& fs) {
   options.create_if_missing = true;
   options.env = &fs;
 
-  const int iterations = 30;
-  cout << "  Running DB open/close lifecycle loop (" << iterations << " iterations)... \n";
+  std::unique_ptr<leveldb::Cache> cache(leveldb::NewLRUCache(2 * 1024 * 1024)); // 2MB block cache
+  options.block_cache = cache.get();
+
+  const int iterations = 800; // Increased to run >= 5s
+  cout << "  Running DB open/close lifecycle loop (" << iterations << " iterations, 1000 writes/reads each)... \n";
   
+  auto start = chrono::high_resolution_clock::now();
   for (int i = 0; i < iterations; ++i) {
     string dbname = "stress_db_lifecycle_" + to_string(i % 5); // Reuse 5 directories to stress file locks
     leveldb::DestroyDB(dbname, options);
@@ -270,21 +301,30 @@ void RunLifecycleLeakStressTest(leveldb::StdFileSystem& fs) {
     
     auto db = std::move(*db_res);
     leveldb::WriteOptions wopt;
-    db->Put(wopt, "key", "val");
+    for (int j = 0; j < 1000; ++j) {
+      db->Put(wopt, "key_" + to_string(j), "val_" + to_string(j));
+    }
+    
+    leveldb::ReadOptions ropt;
+    for (int j = 0; j < 1000; ++j) {
+      auto res = db->Get(ropt, "key_" + to_string(j));
+      assert(res && *res && **res == "val_" + to_string(j));
+    }
     
     // Create an iterator and leave it dangling or destroy it
-    leveldb::ReadOptions ropt;
     unique_ptr<leveldb::Iterator> iter(db->NewIterator(ropt));
     iter->SeekToFirst();
-    assert(iter->Valid() && iter->key() == "key");
+    assert(iter->Valid() && iter->key() == "key_0");
     
     // DB is closed/destructed before iterator is destroyed to stress lifetime safety
-    // Iterator destructor runs after DB object goes out of scope
   }
+  auto end = chrono::high_resolution_clock::now();
+  auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+  cout << "  Lifecycle loop completed in " << fixed << setprecision(3) << duration.count() / 1000000.0 << "s\n";
   cout << "Lifecycle & Leak Stress Test: ✓ (Pass)\n";
 }
 
-// 5. Realistic Ingestion & Query Stress Test
+// 5. Realistic Ingestion & Query Stress Test (covering GetProperty, GetApproximateSizes, CompactRange)
 struct TransactionRecord {
   uint32_t user_id;
   uint64_t timestamp;
@@ -331,6 +371,9 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   options.create_if_missing = true;
   options.write_buffer_size = 1024 * 1024; // 1MB memtable buffer to trigger frequent flushes
   options.env = &fs;
+  
+  std::unique_ptr<leveldb::Cache> cache(leveldb::NewLRUCache(16 * 1024 * 1024)); // 16MB block cache
+  options.block_cache = cache.get();
 
   leveldb::DestroyDB("stress_db_realistic", options);
 
@@ -338,7 +381,7 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   assert(db_res);
   auto db = std::move(*db_res);
 
-  const int num_records = 50000;
+  const int num_records = 600000; // Increased to run >= 5s
   cout << "  Generating " << num_records << " realistic transaction logs...\n" << std::flush;
 
   mt19937 rng(42);
@@ -350,13 +393,13 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
     dataset.push_back(GenerateRandomTx(rng, user_id, ts));
   }
 
-  cout << "  Ingesting data (50,000 writes in batches of 50)... \n" << std::flush;
+  cout << "  Ingesting data (" << num_records << " writes in batches of 100)... \n" << std::flush;
   auto start_write = chrono::high_resolution_clock::now();
   leveldb::WriteOptions wopt;
   
-  for (size_t i = 0; i < dataset.size(); i += 50) {
+  for (size_t i = 0; i < dataset.size(); i += 100) {
     leveldb::WriteBatch batch;
-    for (size_t j = i; j < i + 50 && j < dataset.size(); ++j) {
+    for (size_t j = i; j < i + 100 && j < dataset.size(); ++j) {
       const auto& tx = dataset[j];
       string key = "user:" + to_string(tx.user_id) + ":" + to_string(tx.timestamp);
       batch.Put(key, tx.Serialize());
@@ -371,12 +414,14 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   auto write_duration = chrono::duration_cast<chrono::microseconds>(end_write - start_write);
   PrintThroughput("  Ingestion throughput", num_records, write_duration);
 
-  cout << "  Performing 10,000 random point lookups and range scans...\n" << std::flush;
+  const int num_lookups = 150000; // Increased to run >= 5s
+  const int num_scans = 75000; // Increased to run >= 5s
+  cout << "  Performing " << num_lookups << " random point lookups and " << num_scans << " range scans...\n" << std::flush;
   auto start_read = chrono::high_resolution_clock::now();
   leveldb::ReadOptions ropt;
   int found_count = 0;
 
-  for (int i = 0; i < 5000; ++i) {
+  for (int i = 0; i < num_lookups; ++i) {
     int idx = rng() % num_records;
     const auto& tx = dataset[idx];
     string key = "user:" + to_string(tx.user_id) + ":" + to_string(tx.timestamp);
@@ -387,7 +432,7 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   }
 
   int prefix_scan_count = 0;
-  for (int i = 0; i < 5000; ++i) {
+  for (int i = 0; i < num_scans; ++i) {
     uint32_t search_user = 100000 + (rng() % 10000);
     string prefix = "user:" + to_string(search_user) + ":";
     unique_ptr<leveldb::Iterator> iter(db->NewIterator(ropt));
@@ -400,11 +445,108 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   auto end_read = chrono::high_resolution_clock::now();
   auto read_duration = chrono::duration_cast<chrono::microseconds>(end_read - start_read);
 
-  cout << "  Verified point lookups: " << found_count << " / 5000\n";
+  cout << "  Verified point lookups: " << found_count << " / " << num_lookups << "\n";
   cout << "  Scanned matching user prefix records: " << prefix_scan_count << "\n";
-  PrintThroughput("  Point Lookup & Prefix Scan throughput", 10000, read_duration);
+  PrintThroughput("  Point Lookup & Prefix Scan throughput", num_lookups + num_scans, read_duration);
+
+  // Cover GetApproximateSizes
+  cout << "  Testing GetApproximateSizes API...\n";
+  leveldb::Range ranges[2];
+  ranges[0] = leveldb::Range("user:100000:", "user:102000:");
+  ranges[1] = leveldb::Range("user:105000:", "user:108000:");
+  uint64_t sizes[2];
+  db->GetApproximateSizes(ranges, 2, sizes);
+  cout << "    Approximate size of range 0: " << sizes[0] << " bytes\n";
+  cout << "    Approximate size of range 1: " << sizes[1] << " bytes\n";
+
+  // Cover GetProperty
+  cout << "  Testing GetProperty API...\n";
+  auto stats_prop = db->GetProperty("leveldb.stats");
+  if (stats_prop && *stats_prop) {
+    cout << "    leveldb.stats:\n" << **stats_prop << "\n";
+  }
+  auto sstables_prop = db->GetProperty("leveldb.sstables");
+  if (sstables_prop && *sstables_prop) {
+    cout << "    leveldb.sstables length: " << (*sstables_prop)->size() << " chars\n";
+  }
+  auto mem_usage_prop = db->GetProperty("leveldb.approximate-memory-usage");
+  if (mem_usage_prop && *mem_usage_prop) {
+    cout << "    leveldb.approximate-memory-usage: " << **mem_usage_prop << " bytes\n";
+  }
+
+  // Cover CompactRange
+  cout << "  Testing CompactRange API (Manual compaction of entire DB)...\n" << std::flush;
+  auto start_compact = chrono::high_resolution_clock::now();
+  db->CompactRange(nullptr, nullptr);
+  auto end_compact = chrono::high_resolution_clock::now();
+  auto compact_duration = chrono::duration_cast<chrono::microseconds>(end_compact - start_compact);
+  cout << "    Manual compaction completed in " << fixed << setprecision(3) << compact_duration.count() / 1000000.0 << "s\n";
 
   cout << "Realistic Large-Scale Stress Test: ✓ (Pass)\n";
+}
+
+// 6. RepairDB Stress Test
+void RunRepairStressTest(leveldb::StdFileSystem& fs) {
+  cout << "\n--- [Stress Test 6: Database Repair (RepairDB)] ---\n";
+  leveldb::Options<leveldb::StdFileSystem> options;
+  options.create_if_missing = true;
+  options.env = &fs;
+
+  leveldb::DestroyDB("stress_db_repair", options);
+
+  const int num_keys = 1000000; // Large enough to run >= 5s
+  
+  // Scope 1: Write keys and destruct the DB without compaction
+  {
+    auto db_res = leveldb::DB::Open(options, "stress_db_repair");
+    assert(db_res);
+    auto db = std::move(*db_res);
+    leveldb::WriteOptions wopt;
+    cout << "  Writing " << num_keys << " keys to database for repair...\n" << std::flush;
+    auto start = chrono::high_resolution_clock::now();
+    for (int i = 0; i < num_keys; ++i) {
+      auto res = db->Put(wopt, "repair_key_" + to_string(i), "repair_value_" + to_string(i));
+      if (!res) {
+        cerr << "Put failed during repair setup: " << res.error().ToString() << "\n";
+        exit(1);
+      }
+    }
+    auto end = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+    PrintThroughput("  Writes", num_keys, duration);
+  }
+
+  // Scope 2: Call RepairDB
+  cout << "  Calling RepairDB on stress_db_repair directory...\n" << std::flush;
+  auto start = chrono::high_resolution_clock::now();
+  auto repair_res = leveldb::RepairDB("stress_db_repair", options);
+  auto end = chrono::high_resolution_clock::now();
+  auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
+  if (!repair_res) {
+    cerr << "RepairDB failed: " << repair_res.error().ToString() << "\n";
+    exit(1);
+  }
+  cout << "  RepairDB completed in " << fixed << setprecision(3) << duration.count() / 1000000.0 << "s\n";
+
+  // Scope 3: Reopen database and verify all data is present
+  cout << "  Reopening database and verifying integrity...\n" << std::flush;
+  auto db_res = leveldb::DB::Open(options, "stress_db_repair");
+  if (!db_res) {
+    cerr << "Failed to open repaired DB: " << db_res.error().ToString() << "\n";
+    exit(1);
+  }
+  auto db = std::move(*db_res);
+  leveldb::ReadOptions ropt;
+  int recovered_keys = 0;
+  for (int i = 0; i < num_keys; ++i) {
+    auto get_res = db->Get(ropt, "repair_key_" + to_string(i));
+    if (get_res && *get_res && **get_res == "repair_value_" + to_string(i)) {
+      recovered_keys++;
+    }
+  }
+  cout << "  Verified recovered keys: " << recovered_keys << " / " << num_keys << "\n";
+  assert(recovered_keys == num_keys);
+  cout << "RepairDB Stress Test: ✓ (Pass)\n";
 }
 
 int main() {
@@ -419,6 +561,7 @@ int main() {
   RunCompactionIteratorStressTest(fs);
   RunLifecycleLeakStressTest(fs);
   RunRealisticDataStressTest(fs);
+  RunRepairStressTest(fs);
 
   cout << "\n========================================================\n";
   cout << "       ALL STRESS TESTS COMPLETED SUCCESSFULLY! ✓        \n";

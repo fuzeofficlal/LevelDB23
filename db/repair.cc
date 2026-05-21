@@ -33,14 +33,20 @@ void Log(const std::function<void(std::string_view)>& info_log, const char* fmt,
 
 namespace {
 
+Options<StdFileSystem> SanitizeOptions(const Options<StdFileSystem>& src, const InternalKeyComparator* icmp) {
+  Options<StdFileSystem> result = src;
+  result.comparator = icmp;
+  return result;
+}
+
 class Repairer {
  public:
   Repairer(std::string_view dbname, const Options<StdFileSystem>& options)
       : dbname_(dbname),
         env_(options.env),
-        icmp_(options.comparator),
+        icmp_(options.comparator ? options.comparator : BytewiseComparator()),
         ipolicy_(options.filter_policy),
-        options_(options),
+        options_(SanitizeOptions(options, &icmp_)),
         next_file_number_(1) {
     table_cache_ = new TableCache(dbname_, &options_, 10);
   }

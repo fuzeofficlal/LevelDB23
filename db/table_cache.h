@@ -49,7 +49,7 @@ class TableCache {
     std::unique_ptr<Table<StdFileSystem::RandomAccessFile>> table;
   };
 
-  Result<Entry*> FindTable(uint64_t file_number, uint64_t file_size);
+  Result<std::shared_ptr<Entry>> FindTable(uint64_t file_number, uint64_t file_size);
 
   StdFileSystem* const env_;
   const std::string dbname_;
@@ -59,7 +59,7 @@ class TableCache {
   // we use a simple std::unordered_map with a mutex for the cache.
   // LRU eviction logic can be added later.
   std::mutex mutex_;
-  std::unordered_map<uint64_t, std::unique_ptr<Entry>> cache_;
+  std::unordered_map<uint64_t, std::shared_ptr<Entry>> cache_;
 };
 
 }  // namespace leveldb

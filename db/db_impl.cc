@@ -399,6 +399,7 @@ void DBImpl::BackgroundCall() {
 
     BackgroundCompaction();
     bg_compaction_scheduled_ = false;
+    MaybeScheduleCompaction();
     background_work_finished_signal_.notify_all();
   }
 }
