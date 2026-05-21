@@ -195,17 +195,17 @@ Result<void> DBImpl::Delete(const WriteOptions& options, std::string_view key) {
   return Write(options, &batch);
 }
 
+Task<Result<void>> DBImpl::WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w) {
+  co_return co_await db->WriteAsync(options, w);
+}
+
 Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   CoroutineWriter w;
   w.batch = updates;
   w.sync = options.sync;
   w.done = false;
 
-  auto run = [&]() -> Task<Result<void>> {
-    co_return co_await WriteAsync(options, &w);
-  };
-
-  auto t = run();
+  auto t = WriteSyncHelper(this, options, &w);
   t.resume();
 
   if (!t.done()) {
@@ -419,6 +419,12 @@ void DBImpl::MaybeScheduleCompaction() {
   if (bg_compaction_scheduled_ || shutting_down_.load(std::memory_order_acquire)) {
     return;
   }
+  if (!bg_error_.ok()) {
+    return;
+  }
+  if (imm_ == nullptr && manual_compaction_ == nullptr && !versions_->NeedsCompaction()) {
+    return;
+  }
   bg_compaction_scheduled_ = true;
   background_work_finished_signal_.notify_one();
 }
@@ -434,6 +440,7 @@ void DBImpl::BackgroundCall() {
 
     BackgroundCompaction();
     bg_compaction_scheduled_ = false;
+    MaybeScheduleCompaction();
     background_work_finished_signal_.notify_all();
   }
 }

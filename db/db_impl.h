@@ -66,6 +66,7 @@ class DBImpl : public DB {
   Result<void> MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lk);
   WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
+  static Task<Result<void>> WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();
