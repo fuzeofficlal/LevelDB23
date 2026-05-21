@@ -52,6 +52,7 @@ add_library(leveldb
         db/log_format.h
         db/log_writer.h
         db/log_reader.h
+        db/co_task.h
         table/format.cc
         table/block.cc
         table/block_builder.cc

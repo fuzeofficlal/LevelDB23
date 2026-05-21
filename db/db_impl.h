@@ -13,6 +13,7 @@
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
+#include "db/co_task.h"
 #include "leveldb/db.h"
 #include "leveldb/std_file_system.h"
 #include "db/snapshot.h"
@@ -54,7 +55,6 @@ class DBImpl : public DB {
 
  private:
   friend class DB;
-  struct Writer;
   struct ManualCompaction {
     int level;
     bool done;
@@ -64,7 +64,8 @@ class DBImpl : public DB {
   };
 
   Result<void> MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lk);
-  WriteBatch* BuildBatchGroup(Writer** last_writer);
+  WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
+  Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();
@@ -91,7 +92,7 @@ class DBImpl : public DB {
   uint64_t logfile_number_ = 0;
   std::unique_ptr<log::Writer<StdFileSystem::WritableFile>> log_;
 
-  std::deque<Writer*> writers_;
+  CoWriteQueue co_write_queue_;
   WriteBatch* tmp_batch_;
 
   std::unique_ptr<TableCache> table_cache_;

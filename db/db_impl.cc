@@ -2,6 +2,8 @@
 // Modernized for C++23.
 
 #include "db/db_impl.h"
+#include <semaphore>
+#include <utility>
 #include "db/builder.h"
 #include "db/filename.h"
 #include "db/memtable.h"
@@ -16,14 +18,6 @@
 #include "db/version_edit.h"
 
 namespace leveldb {
-
-struct DBImpl::Writer {
-  Status status;
-  WriteBatch* batch;
-  bool sync;
-  bool done;
-  std::condition_variable cv;
-};
 
 namespace {
 template <typename T, typename V>
@@ -199,31 +193,56 @@ Result<void> DBImpl::Delete(const WriteOptions& options, std::string_view key) {
 }
 
 Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
-  Writer w;
+  CoroutineWriter w;
   w.batch = updates;
   w.sync = options.sync;
   w.done = false;
 
-  std::unique_lock<std::mutex> lk(mutex_);
-  writers_.push_back(&w);
-  
-  while (!w.done && &w != writers_.front()) {
-    w.cv.wait(lk);
-  }
-  if (w.done) return w.status.ok() ? Result<void>() : std::unexpected(w.status);
+  auto run = [&]() -> Task<Result<void>> {
+    co_return co_await WriteAsync(options, &w);
+  };
 
-  auto room_res = MakeRoomForWrite(updates == nullptr, lk);
+  auto t = run();
+  t.resume();
+
+  if (!t.done()) {
+    w.sem.acquire();   // Block the caller thread
+    w.handle.resume(); // Resume coroutine on the caller thread
+  }
+
+  return t.await_resume();
+}
+
+Task<Result<void>> DBImpl::WriteAsync(const WriteOptions& options, CoroutineWriter* w) {
+  co_await co_write_queue_.enqueue(w);
+  
+  if (w->done) {
+    co_return w->status.ok() ? Result<void>() : std::unexpected(w->status);
+  }
+
+  // We are the leader!
+  std::unique_lock<std::mutex> lk(mutex_);
+  auto room_res = MakeRoomForWrite(w->batch == nullptr, lk);
   if (!room_res) {
-    w.status = room_res.error();
-    w.done = true;
-    writers_.pop_front();
-    if (!writers_.empty()) writers_.front()->cv.notify_one();
-    return std::unexpected(w.status);
+    w->status = room_res.error();
+    w->done = true;
+    {
+      std::lock_guard<std::mutex> co_lk(co_write_queue_.mutex());
+      co_write_queue_.writers().pop_front();
+    }
+    // Wake up the next writer in queue
+    {
+      std::lock_guard<std::mutex> co_lk(co_write_queue_.mutex());
+      if (!co_write_queue_.writers().empty()) {
+        co_write_queue_.writers().front()->sem.release();
+      }
+    }
+    co_return std::unexpected(w->status);
   }
 
   uint64_t last_sequence = versions_->LastSequence();
-  Writer* last_writer = &w;
-  if (updates != nullptr) {
+  CoroutineWriter* last_writer = w;
+  if (w->batch != nullptr) {
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
@@ -251,24 +270,36 @@ Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       
       versions_->SetLastSequence(last_sequence);
       
-      w.status = s; // Simplified: assign to all in group
+      w->status = s; // Simplified: assign to all in group
     }
   }
 
+  lk.unlock();
+
   while (true) {
-    Writer* ready = writers_.front();
-    writers_.pop_front();
-    if (ready != &w) {
-      ready->status = w.status;
+    CoroutineWriter* ready = nullptr;
+    {
+      std::lock_guard<std::mutex> co_lk(co_write_queue_.mutex());
+      ready = co_write_queue_.writers().front();
+      co_write_queue_.writers().pop_front();
+    }
+    if (ready != w) {
+      ready->status = w->status;
       ready->done = true;
-      ready->cv.notify_one();
+      ready->sem.release();
     }
     if (ready == last_writer) break;
   }
 
-  if (!writers_.empty()) writers_.front()->cv.notify_one();
+  // Wake up the next writer in queue
+  {
+    std::lock_guard<std::mutex> co_lk(co_write_queue_.mutex());
+    if (!co_write_queue_.writers().empty()) {
+      co_write_queue_.writers().front()->sem.release();
+    }
+  }
   
-  return w.status.ok() ? Result<void>() : std::unexpected(w.status);
+  co_return w->status.ok() ? Result<void>() : std::unexpected(w->status);
 }
 
 Result<void> DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lk) {
@@ -306,8 +337,9 @@ Result<void> DBImpl::MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& 
   }
 }
 
-WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
-  Writer* first = writers_.front();
+WriteBatch* DBImpl::BuildBatchGroup(CoroutineWriter** last_writer) {
+  std::lock_guard<std::mutex> co_lk(co_write_queue_.mutex());
+  CoroutineWriter* first = co_write_queue_.writers().front();
   WriteBatch* result = first->batch;
   assert(result != nullptr);
   
@@ -316,10 +348,10 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   if (size <= (128 << 10)) max_size = size + (128 << 10);
   
   *last_writer = first;
-  auto iter = writers_.begin();
+  auto iter = co_write_queue_.writers().begin();
   ++iter;
-  for (; iter != writers_.end(); ++iter) {
-    Writer* w = *iter;
+  for (; iter != co_write_queue_.writers().end(); ++iter) {
+    CoroutineWriter* w = *iter;
     if (w->sync && !first->sync) break;
     
     if (w->batch != nullptr) {
