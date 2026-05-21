@@ -7,6 +7,7 @@
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "db/log_reader.h"
+#include "db/async_executor.h"
 #include "table/two_level_iterator.h"
 #include "table/merger.h"
 #include "util/coding.h"
@@ -248,6 +249,83 @@ Result<std::optional<std::string>> Version::Get(const ReadOptions& options,
   }
   
   return std::unexpected(Status::NotFoundErr("not found"));
+}
+
+Task<Result<std::optional<std::string>>> Version::GetAsync(
+    const ReadOptions& options, const LookupKey& k, GetStats* stats, AsyncExecutor* executor) {
+  stats->seek_file = nullptr;
+  stats->seek_file_level = -1;
+
+  std::optional<std::string> result;
+  Status s;
+  bool found = false;
+
+  std::shared_ptr<FileMetaData> last_file_read;
+  int last_file_read_level = -1;
+
+  std::vector<std::pair<int, std::shared_ptr<FileMetaData>>> overlapping_files;
+  ForEachOverlapping(k.user_key(), k.internal_key(), [&](int level, std::shared_ptr<FileMetaData> f) {
+    overlapping_files.push_back({level, f});
+    return true; // Keep iterating
+  });
+
+  for (const auto& [level, f] : overlapping_files) {
+    if (stats->seek_file == nullptr && last_file_read != nullptr) {
+      stats->seek_file = last_file_read;
+      stats->seek_file_level = last_file_read_level;
+    }
+
+    last_file_read = f;
+    last_file_read_level = level;
+
+    bool file_found = false;
+    auto get_res = co_await vset_->table_cache_->GetAsync(
+        options, f->number, f->file_size, k.internal_key(),
+        [&](std::string_view ikey, std::string_view v) {
+          auto opt_key = ParseInternalKey(ikey);
+          if (!opt_key) {
+            s = Status::Corruption("corrupted key for " + std::string(k.user_key()));
+            found = true;
+            file_found = true;
+          } else {
+            ParsedInternalKey parsed_key = *opt_key;
+            if (vset_->icmp_.user_comparator()->Compare(parsed_key.user_key, k.user_key()) == 0) {
+              if (parsed_key.type == kTypeValue) {
+                result = std::string(v);
+              } else {
+                result = std::nullopt; // Deleted
+              }
+              found = true;
+              file_found = true;
+            }
+          }
+        },
+        executor);
+
+    if (!get_res) {
+      s = get_res.error();
+      found = true;
+      break; // Stop iteration
+    }
+
+    if (found) {
+      break;
+    }
+  }
+
+  if (!s.ok()) {
+    co_return std::unexpected(s);
+  }
+  
+  if (found) {
+    if (result) {
+      co_return *result;
+    } else {
+      co_return std::unexpected(Status::NotFoundErr("deleted"));
+    }
+  }
+  
+  co_return std::unexpected(Status::NotFoundErr("not found"));
 }
 
 bool Version::UpdateStats(const GetStats& stats) {

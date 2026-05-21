@@ -15,6 +15,10 @@
 
 namespace leveldb {
 
+class AsyncExecutor;
+template <typename T>
+class Task;
+
 struct TableOptions {
   const Comparator* comparator = nullptr;
   Cache* block_cache = nullptr;
@@ -68,6 +72,11 @@ class Table {
       const ReadOptions& options, std::string_view key,
       std::move_only_function<void(std::string_view, std::string_view)> handle_result);
 
+  Task<Result<void>> InternalGetAsync(
+      const ReadOptions& options, std::string_view key,
+      std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+      AsyncExecutor* executor);
+
  private:
   struct Rep;
 
@@ -75,6 +84,10 @@ class Table {
 
   static std::unique_ptr<Iterator> BlockReader(
       const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value);
+
+  static Task<Result<std::unique_ptr<Iterator>>> BlockReaderAsync(
+      const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value,
+      AsyncExecutor* executor);
 
   void ReadMeta(const class Footer& footer);
   void ReadFilter(std::string_view filter_handle_value);

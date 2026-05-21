@@ -17,6 +17,7 @@
 #include "leveldb/db.h"
 #include "leveldb/std_file_system.h"
 #include "db/snapshot.h"
+#include "db/async_executor.h"
 
 namespace leveldb {
 
@@ -66,6 +67,7 @@ class DBImpl : public DB {
   Result<void> MakeRoomForWrite(bool force, std::unique_lock<std::mutex>& lk);
   WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
+  Task<Result<std::optional<std::string>>> GetAsync(const ReadOptions& options, std::string_view key);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();
@@ -97,6 +99,7 @@ class DBImpl : public DB {
 
   std::unique_ptr<TableCache> table_cache_;
   std::unique_ptr<VersionSet> versions_;
+  AsyncExecutor async_executor_;
 
   SnapshotList snapshots_;
   std::atomic<uint32_t> seed_{0};

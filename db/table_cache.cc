@@ -5,6 +5,7 @@
 #include "db/filename.h"
 #include "leveldb/env.h"
 #include "leveldb/table.h"
+#include "db/async_executor.h"
 
 namespace leveldb {
 
@@ -63,6 +64,33 @@ Result<void> TableCache::Get(const ReadOptions& options, uint64_t file_number,
   if (!entry_res) return std::unexpected(entry_res.error());
   
   return (*entry_res)->table->InternalGet(options, k, std::move(handle_result));
+}
+
+Task<Result<void>> TableCache::GetAsync(
+    const ReadOptions& options, uint64_t file_number, uint64_t file_size,
+    std::string_view k,
+    std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+    AsyncExecutor* executor) {
+  Entry* entry = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = cache_.find(file_number);
+    if (it != cache_.end()) {
+      entry = it->second.get();
+    }
+  }
+
+  if (entry == nullptr) {
+    auto entry_res = co_await executor->submit([this, file_number, file_size]() -> Result<Entry*> {
+      return FindTable(file_number, file_size);
+    });
+    if (!entry_res) {
+      co_return std::unexpected(entry_res.error());
+    }
+    entry = *entry_res;
+  }
+
+  co_return co_await entry->table->InternalGetAsync(options, k, std::move(handle_result), executor);
 }
 
 void TableCache::Evict(uint64_t file_number) {

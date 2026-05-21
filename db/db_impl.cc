@@ -369,8 +369,8 @@ WriteBatch* DBImpl::BuildBatchGroup(CoroutineWriter** last_writer) {
   return result;
 }
 
-Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
-                                               std::string_view key) {
+Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& options,
+                                                          std::string_view key) {
   std::unique_lock<std::mutex> lk(mutex_);
   
   uint64_t seq = versions_->LastSequence();
@@ -387,17 +387,17 @@ Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
   
   if (mem) {
     auto mem_res = mem->Get(lkey);
-    if (!mem_res) return std::unexpected(mem_res.error());
-    if (*mem_res) return std::string(**mem_res);
+    if (!mem_res) co_return std::unexpected(mem_res.error());
+    if (*mem_res) co_return std::string(**mem_res);
   }
   if (imm) {
     auto imm_res = imm->Get(lkey);
-    if (!imm_res) return std::unexpected(imm_res.error());
-    if (*imm_res) return std::string(**imm_res);
+    if (!imm_res) co_return std::unexpected(imm_res.error());
+    if (*imm_res) co_return std::string(**imm_res);
   }
   
   Version::GetStats stats;
-  auto v_res = current->Get(options, lkey, &stats);
+  auto v_res = co_await current->GetAsync(options, lkey, &stats, &async_executor_);
   
   bool have_stat_update = false;
   if (current->UpdateStats(stats)) {
@@ -409,7 +409,27 @@ Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
     MaybeScheduleCompaction();
   }
   
-  return v_res;
+  co_return v_res;
+}
+
+Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
+                                               std::string_view key) {
+  std::binary_semaphore sem{0};
+  Result<std::optional<std::string>> result;
+
+  auto task = GetAsync(options, key);
+  
+  auto run_task = [&]() -> Task<void> {
+    result = co_await task;
+    sem.release();
+    co_return;
+  };
+
+  auto t = run_task();
+  t.resume();
+
+  sem.acquire();
+  return result;
 }
 
 void DBImpl::MaybeScheduleCompaction() {

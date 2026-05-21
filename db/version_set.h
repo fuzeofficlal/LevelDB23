@@ -16,6 +16,7 @@
 #include "leveldb/iterator.h"
 
 #include "db/log_writer.h"
+#include "db/co_task.h"
 
 namespace leveldb {
 
@@ -26,6 +27,7 @@ class VersionSet;
 class TableCache;
 class Version;
 class VersionSet;
+class AsyncExecutor;
 
 // Return the smallest index i such that files[i]->largest >= key.
 // Return files.size() if there is no such file.
@@ -55,6 +57,9 @@ class Version : public std::enable_shared_from_this<Version> {
   // Fills *stats for potential compaction trigger.
   [[nodiscard]] Result<std::optional<std::string>> Get(
       const ReadOptions&, const LookupKey& key, GetStats* stats);
+
+  [[nodiscard]] Task<Result<std::optional<std::string>>> GetAsync(
+      const ReadOptions&, const LookupKey& key, GetStats* stats, AsyncExecutor* executor);
 
   bool UpdateStats(const GetStats& stats);
   bool RecordReadSample(std::string_view key);

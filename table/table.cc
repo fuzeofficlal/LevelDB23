@@ -13,6 +13,8 @@
 #include "table/format.h"
 #include "table/two_level_iterator.h"
 #include "util/coding.h"
+#include "db/co_task.h"
+#include "db/async_executor.h"
 
 namespace leveldb {
 
@@ -249,6 +251,109 @@ uint64_t Table<SrcFile>::ApproximateOffsetOf(std::string_view key) const {
     result = rep_->metaindex_handle.offset();
   }
   return result;
+}
+
+template <CRandomAccessFile SrcFile>
+Task<Result<void>> Table<SrcFile>::InternalGetAsync(
+    const ReadOptions& options, std::string_view key,
+    std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+    AsyncExecutor* executor) {
+  Result<void> s;
+  auto iiter = rep_->index_block->NewIterator(rep_->options.comparator);
+  iiter->Seek(key);
+  if (iiter->Valid()) {
+    std::string_view handle_value = iiter->value();
+    FilterBlockReader* filter = rep_->filter;
+    BlockHandle handle;
+    std::string_view hv_copy = handle_value;
+    if (filter != nullptr && handle.DecodeFrom(hv_copy) &&
+        !filter->KeyMayMatch(handle.offset(), key)) {
+      // Not found
+    } else {
+      auto block_iter_res = co_await BlockReaderAsync(this, options, handle_value, executor);
+      if (block_iter_res) {
+        auto& block_iter = *block_iter_res;
+        block_iter->Seek(key);
+        if (block_iter->Valid()) {
+          handle_result(block_iter->key(), block_iter->value());
+        }
+        s = block_iter->status();
+      } else {
+        s = std::unexpected(block_iter_res.error());
+      }
+    }
+  }
+  if (s) {
+    s = iiter->status();
+  }
+  co_return s;
+}
+
+template <CRandomAccessFile SrcFile>
+Task<Result<std::unique_ptr<Iterator>>> Table<SrcFile>::BlockReaderAsync(
+    const Table<SrcFile>* table, const ReadOptions& options, std::string_view index_value,
+    AsyncExecutor* executor) {
+  Cache* block_cache = table->rep_->options.block_cache;
+  std::unique_ptr<Block> block;
+  Cache::CacheHandle cache_handle;
+
+  BlockHandle handle;
+  std::string_view input = index_value;
+  auto s = handle.DecodeFrom(input);
+
+  if (s) {
+    if (block_cache != nullptr) {
+      char cache_key_buffer[16];
+      EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
+      EncodeFixed64(cache_key_buffer + 8, handle.offset());
+      std::string_view key(cache_key_buffer, sizeof(cache_key_buffer));
+      cache_handle = block_cache->Lookup(key);
+      if (cache_handle) {
+        block.reset(reinterpret_cast<Block*>(block_cache->Value(cache_handle.get())));
+      } else {
+        auto contents_res = co_await executor->submit([table, options, handle]() {
+          return ReadBlock(table->rep_->file, options, handle);
+        });
+        if (contents_res) {
+          block = std::make_unique<Block>(std::move(*contents_res));
+          if (contents_res->cachable && options.fill_cache) {
+            Block* raw_block = block.release();
+            cache_handle = block_cache->Insert(key, raw_block, raw_block->size(),
+                                               [](std::string_view, void* value) {
+                                                 delete reinterpret_cast<Block*>(value);
+                                               });
+            block.reset(raw_block); 
+          }
+        } else {
+          s = std::unexpected(contents_res.error());
+        }
+      }
+    } else {
+      auto contents_res = co_await executor->submit([table, options, handle]() {
+        return ReadBlock(table->rep_->file, options, handle);
+      });
+      if (contents_res) {
+        block = std::make_unique<Block>(std::move(*contents_res));
+      } else {
+        s = std::unexpected(contents_res.error());
+      }
+    }
+  }
+
+  std::unique_ptr<Iterator> iter;
+  if (block != nullptr) {
+    iter = block->NewIterator(table->rep_->options.comparator);
+    if (!cache_handle) {
+      Block* raw_block = block.release();
+      iter->RegisterCleanup([raw_block]() { delete raw_block; });
+    } else {
+      block.release();
+      iter->RegisterCleanup([h = std::move(cache_handle)]() {});
+    }
+  } else {
+    iter.reset(NewErrorIterator(s));
+  }
+  co_return iter;
 }
 
 }  // namespace leveldb

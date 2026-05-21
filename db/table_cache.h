@@ -14,8 +14,11 @@
 #include "leveldb/table.h"
 #include "leveldb/std_file_system.h"
 #include "leveldb/cache.h"
+#include "db/co_task.h"
 
 namespace leveldb {
+
+class AsyncExecutor;
 
 class TableCache {
  public:
@@ -35,6 +38,11 @@ class TableCache {
   Result<void> Get(const ReadOptions& options, uint64_t file_number,
                    uint64_t file_size, std::string_view k,
                    std::move_only_function<void(std::string_view, std::string_view)> handle_result);
+
+  Task<Result<void>> GetAsync(const ReadOptions& options, uint64_t file_number,
+                              uint64_t file_size, std::string_view k,
+                              std::move_only_function<void(std::string_view, std::string_view)> handle_result,
+                              AsyncExecutor* executor);
 
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
