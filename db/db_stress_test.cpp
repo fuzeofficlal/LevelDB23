@@ -3,6 +3,7 @@
 #include "include/leveldb/write_batch.h"
 #include "include/leveldb/std_file_system.h"
 #include "include/leveldb/status.h"
+#include "include/leveldb/cache.h"
 #include <iostream>
 #include <vector>
 #include <thread>
@@ -331,6 +332,9 @@ void RunRealisticDataStressTest(leveldb::StdFileSystem& fs) {
   options.create_if_missing = true;
   options.write_buffer_size = 1024 * 1024; // 1MB memtable buffer to trigger frequent flushes
   options.env = &fs;
+  
+  std::unique_ptr<leveldb::Cache> cache(leveldb::NewLRUCache(8 * 1024 * 1024)); // 8MB block cache
+  options.block_cache = cache.get();
 
   leveldb::DestroyDB("stress_db_realistic", options);
 
