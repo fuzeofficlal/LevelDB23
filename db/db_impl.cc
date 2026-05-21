@@ -192,17 +192,17 @@ Result<void> DBImpl::Delete(const WriteOptions& options, std::string_view key) {
   return Write(options, &batch);
 }
 
+Task<Result<void>> DBImpl::WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w) {
+  co_return co_await db->WriteAsync(options, w);
+}
+
 Result<void> DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   CoroutineWriter w;
   w.batch = updates;
   w.sync = options.sync;
   w.done = false;
 
-  auto run = [&]() -> Task<Result<void>> {
-    co_return co_await WriteAsync(options, &w);
-  };
-
-  auto t = run();
+  auto t = WriteSyncHelper(this, options, &w);
   t.resume();
 
   if (!t.done()) {
@@ -412,6 +412,14 @@ Task<Result<std::optional<std::string>>> DBImpl::GetAsync(const ReadOptions& opt
   co_return v_res;
 }
 
+Task<void> DBImpl::GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
+                                 Result<std::optional<std::string>>& result,
+                                 std::binary_semaphore& sem) {
+  result = co_await task;
+  sem.release();
+  co_return;
+}
+
 Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
                                                std::string_view key) {
   std::binary_semaphore sem{0};
@@ -419,13 +427,7 @@ Result<std::optional<std::string>> DBImpl::Get(const ReadOptions& options,
 
   auto task = GetAsync(options, key);
   
-  auto run_task = [&]() -> Task<void> {
-    result = co_await task;
-    sem.release();
-    co_return;
-  };
-
-  auto t = run_task();
+  auto t = GetSyncHelper(task, result, sem);
   t.resume();
 
   sem.acquire();

@@ -68,6 +68,10 @@ class DBImpl : public DB {
   WriteBatch* BuildBatchGroup(CoroutineWriter** last_writer);
   Task<Result<void>> WriteAsync(const WriteOptions& options, CoroutineWriter* w);
   Task<Result<std::optional<std::string>>> GetAsync(const ReadOptions& options, std::string_view key);
+  static Task<Result<void>> WriteSyncHelper(DBImpl* db, const WriteOptions& options, CoroutineWriter* w);
+  static Task<void> GetSyncHelper(Task<Result<std::optional<std::string>>>& task,
+                                  Result<std::optional<std::string>>& result,
+                                  std::binary_semaphore& sem);
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction();
